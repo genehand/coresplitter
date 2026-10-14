@@ -122,16 +122,22 @@ class Client:
         return None
 
     async def send_chan_msg(self, channel: int, text: str, ts: int | None = None):
+        """SEND_CHAN_MSG with the firmware's layout and reply.
+
+        `MyMesh::handleCmdFrame` reads [1]=txt_type, [2]=channel_idx, and
+        answers OK (0x00) or ERROR (0x01), never MSG_SENT -- that is the reply
+        for a *contact* send only.
+        """
         if ts is None:
             ts = int(time.time())
-        payload = b"\x03" + bytes([channel, 0]) + struct.pack("<I", ts) + text.encode()
+        payload = b"\x03\x00" + bytes([channel]) + struct.pack("<I", ts) + text.encode()
         await self.send(payload)
         t0 = time.monotonic()
         while time.monotonic() - t0 < 5:
             p = await self.recv(1)
             if p is None:
                 return None
-            if len(p) and p[0] == 0x06:
+            if len(p) and p[0] in (0x00, 0x01):
                 return p
         return None
 
@@ -281,8 +287,8 @@ async def test_multi_client(proxy_port):
     # c1 sends SEND_CHAN_MSG to channel 0
     await c1.send_chan_msg(0, "Multi-client test")
 
-    # MSG_SENT is consumed by send_chan_msg's drain loop.
-    ok("c1 sent message (MSG_SENT consumed by drain)")
+    # The OK is consumed by send_chan_msg's drain loop.
+    ok("c1 sent message (OK consumed by drain)")
 
     # c2 should receive a synthesized channel message via broadcast_to_others.
     # Since the proxy pins app_target_ver, the echo is the V3 form (0x11);
@@ -1182,8 +1188,8 @@ async def test_history_records_local_sends(history_port):
     await sender.appstart()
     sent = await sender.send_chan_msg(0, text)
     await sender.close()
-    if sent is None or sent[0] != 0x06:
-        fail("SEND_CHAN_MSG did not produce MSG_SENT")
+    if sent is None or sent[0] != 0x00:
+        fail("SEND_CHAN_MSG did not produce OK")
         return
     ok("SEND_CHAN_MSG accepted")
 
@@ -1278,6 +1284,79 @@ async def test_anonymous_listener_never_replays(proxy_port):
         fail(f"anonymous listener replayed logged history: {leaked[:2]}")
     else:
         ok(f"anonymous listener replayed nothing from the log ({len(seen)} live frames seen)")
+
+
+async def test_late_reply_is_not_misattributed(proxy_port, control_port):
+    """Test 22: a reply for a timed-out request does not answer anyone else.
+
+    The radio answers commands in order, so once the proxy has failed a request
+    the next frame to arrive is *that* request's reply -- not the answer to
+    whatever is in flight by then. `Awaiting::Any` would accept it (any non-push
+    code does), hand one client another client's answer and broadcast the
+    displaced reply to everybody.
+    """
+    log.info("--- Test 22: a late reply is not handed to another client ---")
+    ctl = await connect_control(control_port)
+
+    # Park both replies, so the radio keeps the first command unanswered while
+    # the second one reaches the in-flight slot.
+    await ctl.hold(0x03)
+    await ctl.hold(0x05)
+
+    a = await connect_client(port=proxy_port)
+    await a.appstart()
+    await a.send(b"\x03\x00\x00" + struct.pack("<I", int(time.time())) + b"late reply probe")
+
+    err = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 25:
+        p = await a.recv(2)
+        if p is None:
+            break
+        if len(p) and p[0] == 0x01:
+            err = p
+            break
+    if err is None:
+        fail("the parked channel send was never failed with ERROR")
+        await ctl.release()
+        await a.close()
+        await ctl.close()
+        return
+    ok("the parked channel send was failed with ERROR after the in-flight timeout")
+
+    # b takes the in-flight slot. The radio now owes two replies, in order: the
+    # parked 0x03's OK first, then b's CURRENT_TIME.
+    b = await connect_client(port=proxy_port)
+    await b.appstart()
+    await b.send(b"\x05")
+    await asyncio.sleep(0.4)
+    await ctl.release()
+
+    first = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await b.recv(1)
+        if p is None:
+            break
+        # The injector fires MESSAGES_WAITING at every client; only the reply
+        # to b's own request is of interest here.
+        if len(p) and p[0] != 0x83:
+            first = p
+            break
+
+    if first is None:
+        fail("b never received a reply")
+    elif first[0] == 0x00:
+        fail("b was handed the timed-out send's OK as the answer to its own request")
+    elif first[0] == 0x09:
+        ok("b got its own CURRENT_TIME; the late OK was dropped")
+    else:
+        fail(f"b's first reply was 0x{first[0]:02x}, expected 0x09")
+
+    await ctl.release()
+    await a.close()
+    await b.close()
+    await ctl.close()
 
 
 # --- Harness ---
@@ -1394,6 +1473,9 @@ async def main():
         "--listen", f"history:{history_port}",
         "--data-dir", DATA_DIR,
         "--log-level", "info",
+        # The suite waits this out in test 22; the shipped default of 15 s would
+        # only make it slow, and the timeout path is the same either way.
+        "--in-flight-timeout", "6",
     ]
     if not await spawn_proxy():
         await stop_fake()
@@ -1420,6 +1502,7 @@ async def main():
     await test_history_records_local_sends(history_port)
     await test_history_excludes_live_frames(history_port, control_port)
     await test_anonymous_listener_never_replays(proxy_port)
+    await test_late_reply_is_not_misattributed(proxy_port, control_port)
 
     total = PASS + FAIL
     log.info("=" * 40)

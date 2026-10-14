@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -64,6 +65,14 @@ pub struct Cli {
     /// own, and the age at which logged messages are pruned. 0 keeps none.
     #[arg(long, default_value_t = 24, env = "CORESPLITTER_MESSAGE_HISTORY_HOURS")]
     pub message_history_hours: u64,
+
+    /// How long to wait for the radio to answer one command before failing it
+    /// with ERROR. This has to cover the radio's own loop stalls, not just the
+    /// round trip: a radio services the companion interface only between its
+    /// radio tasks, so a slow preset or a busy repeater can hold a reply back
+    /// for seconds after the command itself has already run.
+    #[arg(long, default_value_t = 15, env = "CORESPLITTER_IN_FLIGHT_TIMEOUT")]
+    pub in_flight_timeout: u64,
 
     /// Extra named TCP listener with a resumable message history, as
     /// NAME:PORT[:HOURS]. Repeatable, or comma-separated in the environment.
@@ -146,6 +155,7 @@ impl Cli {
             tcp_frontend_port: self.tcp_frontend_port,
             listeners: parsed.into_iter().map(|(profile, _)| profile).collect(),
             message_history_hours: self.message_history_hours,
+            in_flight_timeout: Duration::from_secs(self.in_flight_timeout.max(1)),
             data_dir: self.data_dir,
             event_log_level,
             event_log_json: self.json,

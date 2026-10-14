@@ -31,7 +31,10 @@ the physical radio — the proxy acts as a **faithful mirror**.
    serialized through a FIFO queue and forwarded one at a time to the
    radio. The radio's reply is routed back to the originating client.
    If the radio disconnects, any in-flight or queued client request is
-   failed immediately with ERROR.
+   failed immediately with ERROR. A request the radio answers too late to
+   beat `--in-flight-timeout` is failed the same way, and the reply that
+   still arrives for it is discarded rather than handed to whichever
+   client is next in line.
 4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG): after the radio
    accepts the forward, a synthetic CONTACT_MSG_RECV / CHANNEL_MSG_RECV
    is echoed to the other clients so they see the message as if it
@@ -199,6 +202,7 @@ All the flags above have `CORESPLITTER_*` equivalents:
 | `CORESPLITTER_TCP_FRONTEND_PORT` | Frontend TCP port (default: 5000) |
 | `CORESPLITTER_DATA_DIR` | Data directory (default: ./data) |
 | `CORESPLITTER_MESSAGE_HISTORY_HOURS` | Message-history retention in hours (default: 24; 0 keeps none) |
+| `CORESPLITTER_IN_FLIGHT_TIMEOUT` | Seconds to wait for the radio's reply to one command before failing it with ERROR (default: 15) |
 | `CORESPLITTER_LISTEN` | Named listeners, comma-separated `NAME:PORT[:HOURS]` |
 | `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `CORESPLITTER_LOG_JSON` | Enable JSON event logging |
@@ -244,6 +248,7 @@ replayed cursor survives it).
 | 19 | Local sends in history | A channel message sent by one client is replayed to the next client on that listener |
 | 20 | Live frames not replayed | A frame logged before the client connected is replayed; one it already saw live is not |
 | 21 | Anonymous listener | The unnamed `--tcp-frontend-port` listener never replays history |
+| 22 | Late reply discarded | A reply arriving after the in-flight timeout is dropped instead of answering another client's request |
 
 ### Fake radio
 

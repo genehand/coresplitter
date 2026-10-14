@@ -579,7 +579,10 @@ class FakeRadio:
                 await w.drain()
 
             case 0x03:
-                w.write(respond_msg_sent())
+                # Channel text sends are answered with a plain OK, not MSG_SENT:
+                # MyMesh.cpp's CMD_SEND_CHANNEL_TXT_MSG branch calls writeOKFrame()
+                # and there is no expected_ack for a group message.
+                w.write(respond_ok())
                 await w.drain()
 
             case 0x04:
