@@ -8,14 +8,23 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{self, Duration};
 
 use crate::backend;
-use crate::frontend::tcp::{ClientCommand, ClientDirectMap, ClientId, TcpFrontend};
-use crate::node::state::{CachedChannel, CachedContact, NodeState};
+use crate::frontend::tcp::{
+    ClientCommand, ClientDirectMap, ClientId, ListenerProfile, TcpFrontend,
+};
+use crate::node::state::{CachedChannel, CachedContact, NewMessage, NodeState};
 use crate::protocol::decode::{
     DecodedValue, decode_command_payload, decode_response_payload, format_decoded,
 };
 
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the log is swept for expired messages. Deliberately far apart:
+/// the sweep is a write on the SQLite pool, which is pinned to one connection
+/// and shared with the radio RX path.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+const SECS_PER_HOUR: i64 = 3600;
 
 /// Protocol version the proxy advertises to the radio as `app_target_ver` in
 /// CMD_DEVICE_QUERY. The firmware only branches on `app_target_ver >= 3`
@@ -142,6 +151,13 @@ pub struct CoreConfig {
     pub tcp_backend_port: u16,
     pub tcp_frontend_host: String,
     pub tcp_frontend_port: u16,
+    /// Named listeners, each with its own message-history cursor. The
+    /// anonymous listener built from the two fields above is prepended to
+    /// these at startup.
+    pub listeners: Vec<ListenerProfile>,
+    /// Retention window: how far back a named listener may replay, and the age
+    /// at which logged messages are pruned.
+    pub message_history_hours: u64,
     pub data_dir: PathBuf,
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
@@ -182,6 +198,33 @@ pub struct Core {
     // sends (0x03) never produce an ACK, so without eviction those
     // entries would accumulate forever.
     pending_acks: HashMap<[u8; 4], (ClientId, Instant)>,
+    // Message-history replay state, one entry per client that has polled on a
+    // history listener. The entry outlives a client's catch-up (so a second
+    // client on the same single-client listener can be spotted) and is
+    // removed when the client goes away. Bounded by connected clients, and
+    // the *persisted* cursors are bounded by the configured listeners.
+    history_sync: HashMap<ClientId, HistorySync>,
+    last_prune: Instant,
+}
+
+/// A client catching up on a listener's message history.
+#[derive(Debug)]
+struct HistorySync {
+    listener: String,
+    /// Last row id handed to this session.
+    cursor: i64,
+    /// Newest row id when the client first spoke on this connection. Frozen
+    /// on purpose: frames newer than this reach the client as live
+    /// broadcasts, so replaying them too would deliver them twice.
+    head: i64,
+    /// Highest row id this client was handed live. Only frames that actually
+    /// reached it count, which is why this is credited at the delivery sites
+    /// rather than by re-reading `latest_message_id()` when the session ends:
+    /// a client that has gone away must not be credited with frames logged
+    /// after it left.
+    live_high: i64,
+    /// Oldest `recv_ts` this listener wants.
+    since_ts: i64,
 }
 
 impl Core {
@@ -212,6 +255,8 @@ impl Core {
             in_flight: None,
             pending_queue: VecDeque::new(),
             pending_acks: HashMap::new(),
+            history_sync: HashMap::new(),
+            last_prune: Instant::now(),
         })
     }
 
@@ -252,13 +297,25 @@ impl Core {
             self.battery_info_raw = Some(blob);
         }
 
-        let frontend_addr = format!(
-            "{}:{}",
-            self.config.tcp_frontend_host, self.config.tcp_frontend_port
-        );
+        self.prune_history().await;
+
+        // The anonymous listener keeps the historical single-port behaviour and
+        // never replays: it serves any number of clients, and a cursor shared
+        // between them would hand history to whichever client polled first and
+        // silently withhold it from the rest.
+        let mut listeners = vec![ListenerProfile {
+            name: None,
+            bind_addr: format!(
+                "{}:{}",
+                self.config.tcp_frontend_host, self.config.tcp_frontend_port
+            ),
+            history_hours: 0,
+        }];
+        listeners.extend(self.config.listeners.iter().cloned());
+
         let shutdown_rx = self.shutdown_rx.clone();
         let mut frontend = TcpFrontend::new(
-            frontend_addr,
+            listeners,
             self.command_tx.clone(),
             self.broadcast_tx.clone(),
             self.client_channels.clone(),
@@ -299,6 +356,7 @@ impl Core {
                 }
                 _ = timeout_tick.tick() => {
                     self.check_in_flight_timeout().await;
+                    self.housekeeping().await;
                 }
             }
         }
@@ -315,6 +373,13 @@ impl Core {
         self.radio_send_tx = None;
         let (_, dummy_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         self.radio_recv_rx = dummy_rx;
+
+        // Persist replay positions for clients still connected, so a restart
+        // does not hand them their own recent history a second time.
+        let clients: Vec<ClientId> = self.history_sync.keys().copied().collect();
+        for client in clients {
+            self.flush_history_cursor(&client, true).await;
+        }
 
         tracing::info!("shutdown complete");
     }
@@ -627,12 +692,21 @@ impl Core {
         let cmd_code = cmd.payload[0];
         self.log_event("->", cmd_code, &cmd.payload);
 
-        // 1. Cache-only paths: serve from RAM / SQLite, never touch the radio.
+        // 1. History replay: a client on a named listener starts a replay
+        //    session the first time it speaks, and its polls are answered from
+        //    the message log until it catches up. The radio is never touched,
+        //    and neither is the single in-flight slot.
+        self.begin_history_sync(&cmd).await;
+        if self.try_serve_history(&cmd).await {
+            return;
+        }
+
+        // 2. Cache-only paths: serve from RAM / SQLite, never touch the radio.
         if self.try_serve_from_cache(cmd_code, &cmd).await {
             return;
         }
 
-        // 2. Anything else goes through the serialized radio queue.
+        // 3. Anything else goes through the serialized radio queue.
         self.enqueue_or_dispatch(Some(cmd.client_id), cmd.payload)
             .await;
     }
@@ -683,6 +757,207 @@ impl Core {
             _ => {}
         }
         false
+    }
+
+    /// Start a replay session for a client on a history listener, the first
+    /// time it speaks.
+    ///
+    /// This runs for every command, not just 0x0A, because `head` marks the
+    /// point from which frames already reach this client as live broadcasts.
+    /// Snapshotted at the first poll instead, a client that connected and only
+    /// synced later would have everything it had already been shown replayed
+    /// back to it.
+    async fn begin_history_sync(&mut self, cmd: &ClientCommand) {
+        if !cmd.listener.replays_history() || self.history_sync.contains_key(&cmd.client_id) {
+            return;
+        }
+        let Some(listener) = cmd.listener.name.as_deref() else {
+            return;
+        };
+        // Nothing logged yet: no history to hand out, so no state to keep.
+        // `try_serve_history` picks it up if the log fills in later.
+        let Some(head) = self.state.latest_message_id().await.ok().flatten() else {
+            return;
+        };
+
+        // A named listener is a single-client slot. Two clients on one name
+        // share a cursor, so the newcomer silently gets whatever the other one
+        // has not consumed. Say so instead of leaving it mysterious. Only live
+        // clients count: the reaper runs on the 1 s tick, so a just-departed
+        // client may still have an entry.
+        let listener_taken = self
+            .history_sync
+            .iter()
+            .any(|(client, sync)| sync.listener == listener && self.client_is_alive(client));
+        if listener_taken {
+            tracing::warn!(
+                listener = %listener,
+                client = %cmd.client_id,
+                "second client on a single-client listener: it shares that \
+                 listener's history cursor"
+            );
+        }
+
+        let cursor = self
+            .state
+            .history_cursor(listener)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        tracing::info!(
+            listener = %listener,
+            cursor,
+            head,
+            hours = cmd.listener.history_hours,
+            "client syncing message history"
+        );
+        self.history_sync.insert(
+            cmd.client_id,
+            HistorySync {
+                listener: listener.to_string(),
+                cursor,
+                head,
+                live_high: 0,
+                since_ts: history_window_start(cmd.listener.history_hours),
+            },
+        );
+    }
+
+    /// Record that a logged frame reached clients live, so it is not handed to
+    /// them a second time by a later replay.
+    ///
+    /// Called from the delivery sites, not from the log: the proxy's own
+    /// synthetic echo skips the sender, and a frame the radio pushes while a
+    /// non-0x0A request is in flight goes to one client as its accidental
+    /// reply and nobody else. Crediting on the strength of "it was logged"
+    /// would quietly drop those frames from the other clients' history.
+    fn credit_history_receipts(&mut self, id: i64, exclude: Option<&ClientId>) {
+        // Only live clients: the reaper runs on the 1 s tick, so a client that
+        // has already gone away still has an entry, and crediting it would
+        // drop the frame from the listener's shared cursor for everyone after.
+        let alive: Vec<ClientId> = self
+            .history_sync
+            .keys()
+            .filter(|client| self.client_is_alive(client))
+            .copied()
+            .collect();
+        for client in alive {
+            if exclude == Some(&client) {
+                continue;
+            }
+            if let Some(sync) = self.history_sync.get_mut(&client) {
+                sync.live_high = sync.live_high.max(id);
+            }
+        }
+    }
+
+    /// Answer CMD_SYNC_NEXT_MESSAGE (0x0A) from the message log while a client
+    /// on a named listener is still catching up.
+    ///
+    /// Returns true when the command was answered here, in which case it must
+    /// not be forwarded: the client gets exactly the one frame per poll the
+    /// radio would have replied with, but the single in-flight slot stays free
+    /// for real traffic.
+    async fn try_serve_history(&mut self, cmd: &ClientCommand) -> bool {
+        if !cmd.listener.replays_history() || cmd.payload.first() != Some(&0x0A) {
+            return false;
+        }
+
+        let Some(sync) = self.history_sync.get(&cmd.client_id) else {
+            return false;
+        };
+        let (cursor, head, since_ts) = (sync.cursor, sync.head, sync.since_ts);
+        if cursor >= head {
+            return false;
+        }
+
+        let frame = match self.state.next_channel_frame(cursor, head, since_ts).await {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read message history");
+                return false;
+            }
+        };
+        let Some(frame) = frame else {
+            // Nothing inside the window is left: pruned, or logged before this
+            // listener existed. Credit the client and let the radio take over.
+            if let Some(sync) = self.history_sync.get_mut(&cmd.client_id) {
+                sync.cursor = head;
+            }
+            self.flush_history_cursor(&cmd.client_id, false).await;
+            return false;
+        };
+
+        let reached_head = frame.id >= head;
+        self.send_to_client(&cmd.client_id, frame.raw);
+        if let Some(sync) = self.history_sync.get_mut(&cmd.client_id) {
+            sync.cursor = frame.id;
+        }
+        if reached_head {
+            self.flush_history_cursor(&cmd.client_id, false).await;
+        }
+        true
+    }
+
+    /// Write a client's replay cursor back to its listener's kv_store entry.
+    ///
+    /// A client that finished its replay is credited with everything that
+    /// reached it live from then on; replaying those frames after a reconnect
+    /// would only duplicate them. A client that died mid-replay keeps its exact
+    /// position, so a few frames it already saw may repeat, but none it never
+    /// received are skipped.
+    async fn flush_history_cursor(&mut self, client_id: &ClientId, forget: bool) {
+        let Some(sync) = self.history_sync.get(client_id) else {
+            return;
+        };
+        let listener = sync.listener.clone();
+        let value = if sync.cursor >= sync.head {
+            sync.cursor.max(sync.live_high)
+        } else {
+            sync.cursor
+        };
+        if forget {
+            self.history_sync.remove(client_id);
+        }
+        if let Err(e) = self.state.set_history_cursor(&listener, value).await {
+            tracing::warn!(error = %e, listener = %listener, "failed to persist history cursor");
+            return;
+        }
+        tracing::debug!(listener = %listener, cursor = value, "persisted history cursor");
+    }
+
+    /// Periodic maintenance on the 1 s tick: retire clients that have gone
+    /// away, and sweep expired messages.
+    async fn housekeeping(&mut self) {
+        let dead: Vec<ClientId> = self
+            .history_sync
+            .keys()
+            .filter(|client| !self.client_is_alive(client))
+            .copied()
+            .collect();
+        for client in dead {
+            // The frontend drops disconnected clients from ClientDirectMap
+            // without telling the actor, so this is the only disconnect signal
+            // a history cursor gets.
+            self.flush_history_cursor(&client, true).await;
+        }
+
+        if self.last_prune.elapsed() >= PRUNE_INTERVAL {
+            self.prune_history().await;
+        }
+    }
+
+    /// Delete logged messages older than the retention window. A window of
+    /// zero hours therefore keeps nothing at all.
+    async fn prune_history(&mut self) {
+        let before = history_window_start(self.config.message_history_hours);
+        match self.state.prune_messages(before).await {
+            Ok(0) => {}
+            Ok(rows) => tracing::debug!(rows, "pruned message history"),
+            Err(e) => tracing::warn!(error = %e, "failed to prune message history"),
+        }
+        self.last_prune = Instant::now();
     }
 
     /// Enqueue the command if the radio is busy with a previous request,
@@ -781,7 +1056,13 @@ impl Core {
 
     /// Synthesize a CONTACT_MSG_RECV (0x07) for the rest of the clients so
     /// they see this message as if it had arrived over LoRa from the radio.
-    async fn synthesize_contact_echo(&self, sender: &ClientId, payload: &[u8]) {
+    ///
+    /// Unlike the channel echo this stays on the legacy frame even though the
+    /// proxy pins `app_target_ver` to the V3 generation: the V3 contact form
+    /// carries a variable-length sender prefix for signed messages, which this
+    /// echo does not model. Contact frames are never replayed, so a mixed
+    /// generation in the log costs nothing.
+    async fn synthesize_contact_echo(&mut self, sender: &ClientId, payload: &[u8]) {
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_MSG");
             return;
@@ -800,14 +1081,33 @@ impl Core {
         fake.extend_from_slice(text.as_bytes());
         self.broadcast_to_others(Some(sender), &fake);
 
-        let _ = self
+        // The sender is excluded from its own echo, so it is credited for
+        // every other client but not for this frame.
+        if let Ok(id) = self
             .state
-            .insert_message("contact", Some(from_key), None, &text, ts)
-            .await;
+            .insert_message(&NewMessage {
+                msg_type: "contact",
+                from_key: Some(from_key),
+                channel_idx: None,
+                text: &text,
+                timestamp: ts,
+                raw: &fake,
+                code: 0x07,
+                recv_ts: chrono::Utc::now().timestamp(),
+            })
+            .await
+        {
+            self.credit_history_receipts(id, Some(sender));
+        }
     }
 
-    /// Synthesize a CHANNEL_MSG_RECV (0x08) for the rest of the clients.
-    async fn synthesize_channel_echo(&self, sender: &ClientId, payload: &[u8]) {
+    /// Synthesize a CHANNEL_MSG_RECV_V3 (0x11) for the rest of the clients.
+    ///
+    /// The V3 form rather than the legacy 0x08, because `app_target_ver` is
+    /// pinned to APP_TARGET_VER: the radio only ever emits V3 and clients are
+    /// told firmware 13, so an echo in any other generation would be a frame
+    /// the radio itself would no longer produce.
+    async fn synthesize_channel_echo(&mut self, sender: &ClientId, payload: &[u8]) {
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG");
             return;
@@ -817,19 +1117,37 @@ impl Core {
         let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
         let text = String::from_utf8_lossy(&payload[7..]).to_string();
 
-        let mut fake = Vec::with_capacity(8 + text.len());
-        fake.push(0x08);
+        let mut fake = Vec::with_capacity(11 + text.len());
+        fake.push(0x11);
+        fake.push(0); // snr: there was no radio reception behind this message
+        fake.push(0); // reserved1
+        fake.push(0); // reserved2
         fake.push(payload[2]); // channel
         fake.push(0); // path_len
-        fake.push(0); // txt_type = text
+        fake.push(0); // txt_type = TXT_TYPE_PLAIN
         fake.extend_from_slice(&payload[3..7]); // timestamp
         fake.extend_from_slice(text.as_bytes());
         self.broadcast_to_others(Some(sender), &fake);
 
-        let _ = self
+        // The sender is excluded from its own echo, so it is credited for
+        // every other client but not for this frame: its own message is still
+        // replayed to it if it ever syncs the history back.
+        if let Ok(id) = self
             .state
-            .insert_message("channel", Some(from_key), Some(channel), &text, ts)
-            .await;
+            .insert_message(&NewMessage {
+                msg_type: "channel",
+                from_key: Some(from_key),
+                channel_idx: Some(channel),
+                text: &text,
+                timestamp: ts,
+                raw: &fake,
+                code: 0x11,
+                recv_ts: chrono::Utc::now().timestamp(),
+            })
+            .await
+        {
+            self.credit_history_receipts(id, Some(sender));
+        }
     }
 
     /// Called on every timeout tick. If the current in_flight has been
@@ -975,7 +1293,7 @@ impl Core {
         let resp_code = payload[0];
         self.log_event("<-", resp_code, &payload);
 
-        self.cache_response(resp_code, &payload).await;
+        let logged = self.cache_response(resp_code, &payload).await;
 
         if self.config.record_radio_rx {
             let _ = self.state.insert_raw_rx(resp_code, &payload).await;
@@ -983,7 +1301,10 @@ impl Core {
 
         // 1. If the frame completes (or belongs to) the in_flight request,
         //    route it to that client.
-        if self.try_route_to_in_flight(resp_code, &payload).await {
+        if self
+            .try_route_to_in_flight(resp_code, &payload, logged)
+            .await
+        {
             return;
         }
         // 2. If it's a late ACK matching a previous MSG_SENT, route it.
@@ -991,13 +1312,24 @@ impl Core {
             return;
         }
         // 3. Otherwise it's a spontaneous push event from the radio
-        //    (MESSAGES_WAITING, ADVERTISEMENT, NEW_ADVERT, ...).
+        //    (MESSAGES_WAITING, ADVERTISEMENT, NEW_ADVERT, ...), which
+        //    everybody received.
         let _ = self.broadcast_tx.send(payload);
+        if let Some(id) = logged {
+            self.credit_history_receipts(id, None);
+        }
     }
 
     /// Match the response against the current in_flight request. Returns
     /// true if it was routed (whether or not it terminated the request).
-    async fn try_route_to_in_flight(&mut self, code: u8, payload: &[u8]) -> bool {
+    /// `logged` is the row id `cache_response` just assigned, when the frame
+    /// carried a message at all.
+    async fn try_route_to_in_flight(
+        &mut self,
+        code: u8,
+        payload: &[u8],
+        logged: Option<i64>,
+    ) -> bool {
         let Some(in_flight) = self.in_flight.as_ref() else {
             return false;
         };
@@ -1054,6 +1386,11 @@ impl Core {
         // an inbound group datagram.
         if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
             self.broadcast_to_others(client_id.as_ref(), payload);
+            // Everybody saw it: the originator as its poll reply, the rest as
+            // this broadcast.
+            if let Some(id) = logged {
+                self.credit_history_receipts(id, None);
+            }
         }
 
         if is_terminator {
@@ -1077,7 +1414,9 @@ impl Core {
         true
     }
 
-    async fn cache_response(&mut self, code: u8, payload: &[u8]) {
+    async fn cache_response(&mut self, code: u8, payload: &[u8]) -> Option<i64> {
+        let recv_ts = chrono::Utc::now().timestamp();
+        let mut logged = None;
         match code {
             0x03 if payload.len() >= 148 => {
                 let pk = payload[1..33].to_vec();
@@ -1149,12 +1488,22 @@ impl Core {
                         })
                         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-                    if let Err(e) = self
+                    match self
                         .state
-                        .insert_message("contact", from_key.as_deref(), None, &text, ts)
+                        .insert_message(&NewMessage {
+                            msg_type: "contact",
+                            from_key: from_key.as_deref(),
+                            channel_idx: None,
+                            text: &text,
+                            timestamp: ts,
+                            raw: payload,
+                            code,
+                            recv_ts,
+                        })
                         .await
                     {
-                        tracing::warn!(error = %e, "failed to cache message");
+                        Ok(id) => logged = Some(id),
+                        Err(e) => tracing::warn!(error = %e, "failed to cache message"),
                     }
                 }
             }
@@ -1179,12 +1528,22 @@ impl Core {
                         })
                         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-                    if let Err(e) = self
+                    match self
                         .state
-                        .insert_message("channel", None, channel_idx, &text, ts)
+                        .insert_message(&NewMessage {
+                            msg_type: "channel",
+                            from_key: None,
+                            channel_idx,
+                            text: &text,
+                            timestamp: ts,
+                            raw: payload,
+                            code,
+                            recv_ts,
+                        })
                         .await
                     {
-                        tracing::warn!(error = %e, "failed to cache channel message");
+                        Ok(id) => logged = Some(id),
+                        Err(e) => tracing::warn!(error = %e, "failed to cache channel message"),
                     }
                 }
             }
@@ -1198,12 +1557,22 @@ impl Core {
                 } else {
                     String::new()
                 };
-                if let Err(e) = self
+                match self
                     .state
-                    .insert_message("contact", from_key.as_deref(), None, &text, ts)
+                    .insert_message(&NewMessage {
+                        msg_type: "contact",
+                        from_key: from_key.as_deref(),
+                        channel_idx: None,
+                        text: &text,
+                        timestamp: ts,
+                        raw: payload,
+                        code,
+                        recv_ts,
+                    })
                     .await
                 {
-                    tracing::warn!(error = %e, "failed to cache V3 contact message");
+                    Ok(id) => logged = Some(id),
+                    Err(e) => tracing::warn!(error = %e, "failed to cache V3 contact message"),
                 }
             }
             0x11 if payload.len() >= 11 => {
@@ -1214,12 +1583,22 @@ impl Core {
                 } else {
                     String::new()
                 };
-                if let Err(e) = self
+                match self
                     .state
-                    .insert_message("channel", None, Some(channel_idx), &text, ts)
+                    .insert_message(&NewMessage {
+                        msg_type: "channel",
+                        from_key: None,
+                        channel_idx: Some(channel_idx),
+                        text: &text,
+                        timestamp: ts,
+                        raw: payload,
+                        code,
+                        recv_ts,
+                    })
                     .await
                 {
-                    tracing::warn!(error = %e, "failed to cache V3 channel message");
+                    Ok(id) => logged = Some(id),
+                    Err(e) => tracing::warn!(error = %e, "failed to cache V3 channel message"),
                 }
             }
             0x12 if payload.len() >= 50 => {
@@ -1241,6 +1620,7 @@ impl Core {
             }
             _ => {}
         }
+        logged
     }
 
     fn log_event(&self, arrow: &str, code: u8, payload: &[u8]) {
@@ -1324,6 +1704,12 @@ impl Core {
             tracing::info!("{msg}");
         }
     }
+}
+
+/// Oldest `recv_ts` a window of `hours` covers, measured on the proxy's own
+/// clock. Never on the sender's RTC stamp: those arrive skewed or zeroed.
+fn history_window_start(hours: u64) -> i64 {
+    chrono::Utc::now().timestamp() - hours as i64 * SECS_PER_HOUR
 }
 
 fn sanitize(msg: &str) -> String {

@@ -1,8 +1,11 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::core::{BackendType, CoreConfig, LogLevel};
+use crate::frontend::tcp::ListenerProfile;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,6 +59,26 @@ pub struct Cli {
     #[arg(long, default_value = "./data", env = "CORESPLITTER_DATA_DIR")]
     pub data_dir: PathBuf,
 
+    /// Total message-history retention in hours. Named listeners replay at most
+    /// this far back, the default history depth of a listener that omits its
+    /// own, and the age at which logged messages are pruned. 0 keeps none.
+    #[arg(long, default_value_t = 24, env = "CORESPLITTER_MESSAGE_HISTORY_HOURS")]
+    pub message_history_hours: u64,
+
+    /// Extra named TCP listener with a resumable message history, as
+    /// NAME:PORT[:HOURS]. Repeatable, or comma-separated in the environment.
+    ///
+    /// Each named listener is a single-client slot: clients on the same name
+    /// share one history cursor, so give every device its own name. The
+    /// unnamed --tcp-frontend-port listener never replays history.
+    #[arg(
+        long = "listen",
+        value_name = "NAME:PORT[:HOURS]",
+        env = "CORESPLITTER_LISTEN",
+        value_delimiter = ','
+    )]
+    pub listen: Vec<String>,
+
     /// Log level: off, error, warn, info, debug, verbose
     #[arg(long, default_value = "info", env = "CORESPLITTER_LOG_LEVEL")]
     pub log_level: String,
@@ -70,7 +93,7 @@ pub struct Cli {
 }
 
 impl Cli {
-    pub fn into_config(self) -> CoreConfig {
+    pub fn into_config(self) -> Result<CoreConfig> {
         let backend_type = if self.serial.is_some() {
             BackendType::Serial
         } else if self.ble.is_some() {
@@ -87,7 +110,31 @@ impl Cli {
             _ => LogLevel::Summary,
         };
 
-        CoreConfig {
+        let parsed: Vec<(ListenerProfile, u16)> = self
+            .listen
+            .iter()
+            .map(|spec| parse_listener(spec, &self.tcp_frontend_host, self.message_history_hours))
+            .collect::<Result<_>>()?;
+
+        // History is keyed by listener name, so a duplicate name would have two
+        // listeners fighting over one cursor; a duplicate port means one bind
+        // fails at startup anyway, but say so clearly.
+        let mut names = HashSet::new();
+        let mut ports = HashSet::from([self.tcp_frontend_port]);
+        for (profile, port) in &parsed {
+            let name = profile.name.clone().unwrap_or_default();
+            if !names.insert(name.clone()) {
+                bail!(
+                    "duplicate listener name '{name}': history is keyed by name, \
+                     so two listeners must not share one"
+                );
+            }
+            if !ports.insert(*port) {
+                bail!("listener '{name}' reuses TCP port {port}");
+            }
+        }
+
+        Ok(CoreConfig {
             backend_type,
             serial_port: self.serial,
             serial_baud: self.baud,
@@ -97,10 +144,55 @@ impl Cli {
             tcp_backend_port: self.tcp_backend_port,
             tcp_frontend_host: self.tcp_frontend_host,
             tcp_frontend_port: self.tcp_frontend_port,
+            listeners: parsed.into_iter().map(|(profile, _)| profile).collect(),
+            message_history_hours: self.message_history_hours,
             data_dir: self.data_dir,
             event_log_level,
             event_log_json: self.json,
             record_radio_rx: self.record_radio_rx,
-        }
+        })
     }
+}
+
+/// Parse `NAME:PORT[:HOURS]`. `HOURS` defaults to the global retention, which
+/// is also its ceiling: a listener may narrow the window, never widen it.
+fn parse_listener(spec: &str, host: &str, retention_hours: u64) -> Result<(ListenerProfile, u16)> {
+    let mut fields = spec.split(':');
+    let name = fields.next().unwrap_or_default().trim();
+    let port = fields.next();
+    let hours = fields.next();
+    if fields.next().is_some() {
+        bail!("listener '{spec}': expected NAME:PORT[:HOURS]");
+    }
+    if name.is_empty() {
+        bail!("listener '{spec}': a name is required, it is the history identity");
+    }
+
+    let port: u16 = port
+        .context("a port is required")?
+        .trim()
+        .parse()
+        .with_context(|| format!("listener '{name}': invalid port"))?;
+    let hours = match hours {
+        Some(hours) => hours
+            .trim()
+            .parse()
+            .with_context(|| format!("listener '{name}': invalid hour count"))?,
+        None => retention_hours,
+    };
+    if hours > retention_hours {
+        bail!(
+            "listener '{name}' asks for {hours}h of history but \
+             --message-history-hours is {retention_hours}"
+        );
+    }
+
+    Ok((
+        ListenerProfile {
+            name: Some(name.to_string()),
+            bind_addr: format!("{host}:{port}"),
+            history_hours: hours,
+        },
+        port,
+    ))
 }

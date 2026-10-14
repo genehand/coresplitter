@@ -233,6 +233,17 @@ def msg_text(p: bytes) -> str:
     return p[_TEXT_OFFSET[p[0]]:].decode("utf-8", errors="replace")
 
 
+def v3_channel_frame(channel: int, text: bytes, ts: int | None = None) -> bytes:
+    """A CHANNEL_MSG_RECV_V3 payload laid out the way the firmware emits it."""
+    if ts is None:
+        ts = int(time.time())
+    return bytes([0x11, 0, 0, 0, channel, 0, 0]) + struct.pack("<I", ts) + text
+
+
+def is_channel_frame(p: bytes) -> bool:
+    return bool(p) and p[0] in CHANNEL_MSG_CODES
+
+
 # --- Test cases ---
 
 PASS = 0
@@ -273,8 +284,10 @@ async def test_multi_client(proxy_port):
     # MSG_SENT is consumed by send_chan_msg's drain loop.
     ok("c1 sent message (MSG_SENT consumed by drain)")
 
-    # c2 should receive a synthesized CHANNEL_MSG_RECV (0x08) via broadcast
-    got_broadcast = False
+    # c2 should receive a synthesized channel message via broadcast_to_others.
+    # Since the proxy pins app_target_ver, the echo is the V3 form (0x11);
+    # accept either generation, as everywhere else in this suite.
+    got_broadcast = None
     t0 = time.monotonic()
     while time.monotonic() - t0 < 5:
         p = await c2.recv(2)
@@ -282,12 +295,16 @@ async def test_multi_client(proxy_port):
             break
         if len(p) == 0:
             continue
-        if p[0] == 0x08 and b"Multi-client test" in p:
-            got_broadcast = True
+        if p[0] in CHANNEL_MSG_CODES and b"Multi-client test" in p:
+            got_broadcast = p
             break
 
     if got_broadcast:
-        ok("c2 receives CHANNEL_MSG_RECV (0x08) via broadcast_to_others")
+        ok(f"c2 receives the channel echo (0x{got_broadcast[0]:02x}) via broadcast_to_others")
+        if got_broadcast[0] == 0x11:
+            ok(f"the channel echo uses the pinned V3 generation: {msg_text(got_broadcast)!r}")
+        else:
+            fail(f"channel echo is legacy {got_broadcast[0]:#04x}, but app_target_ver is pinned to V3")
     else:
         fail("c2 did not receive broadcast message")
 
@@ -1036,6 +1053,224 @@ async def test_ack_routes_past_in_flight_request(proxy_port, control_port):
     await ctl.close()
 
 
+async def drain_history(client, needle: bytes | None = None, limit: int = 200):
+    """Poll GET_MSG and return the channel frames it yields, in order.
+
+    Stops early once `needle` shows up in a frame. Frames that are not channel
+    messages (MESSAGES_WAITING pushes, NO_MORE_MSGS) are skipped by the client
+    helper and never land here.
+    """
+    frames = []
+    t0 = time.monotonic()
+    while len(frames) < limit and time.monotonic() - t0 < 20:
+        p = await client.get_message()
+        if p is None:
+            break
+        if is_channel_frame(p):
+            frames.append(p)
+            if needle is not None and needle in p:
+                break
+    return frames
+
+
+async def drain_history_until_no_more(client, limit: int = 60):
+    """Drain the replay until the proxy hands the poll back to the radio.
+
+    A NO_MORE_MSGS reply (0x0A) means the log is exhausted and the client is
+    caught up, which is the signal that the replay is complete.
+    """
+    frames = []
+    t0 = time.monotonic()
+    while len(frames) < limit and time.monotonic() - t0 < 25:
+        p = await client.get_message()
+        if p is None or p[0] == 0x0A:
+            break
+        if is_channel_frame(p):
+            frames.append(p)
+    return frames
+
+
+async def test_history_replay(history_port, control_port):
+    log.info("--- Test 16: named listener replays the logged channel history ---")
+    ctl = await connect_control(control_port)
+    seed = b"History seed one"
+    payload = v3_channel_frame(0, seed)
+
+    # `push` hands the frame to the proxy the way an unsolicited radio frame
+    # arrives: the proxy logs it and broadcasts it. Nothing has a request in
+    # flight at this moment, so there is no in-flight slot for it to be
+    # misdelivered as an answer to.
+    await ctl.push(payload.hex())
+    await asyncio.sleep(0.5)
+
+    h = await connect_client(port=history_port)
+    await h.appstart()
+    frames = await drain_history(h, needle=seed)
+    await h.close()
+
+    if not any(seed in p for p in frames):
+        fail(f"named listener did not replay the logged message ({len(frames)} frames)")
+        await ctl.close()
+        return
+    ok(f"named listener replayed the logged message (frame {len(frames)} of the sync)")
+
+    replayed = next(p for p in frames if seed in p)
+    if replayed == payload:
+        ok("the replayed frame is byte-identical to what the radio emitted")
+    else:
+        fail(f"replayed frame differs from the radio's: {replayed.hex()}")
+    await ctl.close()
+
+
+async def test_history_resume(history_port, control_port):
+    log.info("--- Test 17: a reconnect resumes instead of replaying ---")
+    ctl = await connect_control(control_port)
+    seed = b"History seed two"
+    payload = v3_channel_frame(0, seed)
+    await ctl.push(payload.hex())
+    await asyncio.sleep(0.5)
+
+    h = await connect_client(port=history_port)
+    await h.appstart()
+    frames = await drain_history(h, needle=seed, limit=8)
+    await h.close()
+    await ctl.close()
+
+    if not frames:
+        fail("the resumed session was handed no history at all")
+        return
+    if seed in frames[0]:
+        ok("the resumed session starts at the new message, not at the window start")
+    else:
+        fail(f"resume started at {msg_text(frames[0])[:30]!r} instead of the new message")
+    if len(frames) == 1:
+        ok("no frame the previous client already had was replayed")
+    else:
+        fail(f"replayed {len(frames)} frames; only the unseen one should have been")
+
+
+async def test_history_survives_restart(history_port, control_port):
+    log.info("--- Test 18: history cursor survives a proxy restart ---")
+    await stop_proxy()
+    if not await spawn_proxy():
+        fail("proxy did not come back after a restart")
+        return
+    await asyncio.sleep(0.5)
+
+    ctl = await connect_control(control_port)
+    seed = b"History seed three"
+    await ctl.push(v3_channel_frame(0, seed).hex())
+    await asyncio.sleep(0.5)
+
+    h = await connect_client(port=history_port)
+    await h.appstart()
+    frames = await drain_history(h, needle=seed, limit=8)
+    await h.close()
+    await ctl.close()
+
+    if frames and seed in frames[0]:
+        ok("cursor persisted in kv_store: replay resumed at the new message")
+    else:
+        first = msg_text(frames[0])[:30] if frames else "none"
+        fail(f"after the restart the replay started at {first!r}, not the new message")
+
+
+async def test_history_records_local_sends(history_port):
+    log.info("--- Test 19: a locally sent channel message enters the history ---")
+    text = "History local send"
+    sender = await connect_client(port=history_port)
+    await sender.appstart()
+    sent = await sender.send_chan_msg(0, text)
+    await sender.close()
+    if sent is None or sent[0] != 0x06:
+        fail("SEND_CHAN_MSG did not produce MSG_SENT")
+        return
+    ok("SEND_CHAN_MSG accepted")
+
+    h = await connect_client(port=history_port)
+    await h.appstart()
+    frames = await drain_history(h, needle=text.encode(), limit=8)
+    await h.close()
+
+    if frames and text.encode() in frames[0]:
+        ok("the synthesized echo was logged and replayed to the next client")
+    else:
+        first = msg_text(frames[0])[:30] if frames else "none"
+        fail(f"a locally sent message never reached the history (first frame {first!r})")
+
+
+async def test_history_excludes_live_frames(history_port, control_port):
+    log.info("--- Test 20: frames the client already saw live are not replayed ---")
+    ctl = await connect_control(control_port)
+
+    # A listener is a single-client slot, and the cursor is shared by name:
+    # anything still connected here would receive this frame live and consume
+    # it, leaving nothing for the client below to be replayed.
+    await asyncio.sleep(1.5)
+
+    # Logged before the client connects: it has never seen this one, so the
+    # replay must hand it over.
+    before = b"History before connect"
+    await ctl.push(v3_channel_frame(0, before).hex())
+    await asyncio.sleep(0.5)
+
+    x = await connect_client(port=history_port)
+    # The replay snapshot is taken at the first command, not at the first poll,
+    # so the frame pushed below stays outside it.
+    await x.appstart()
+
+    live = b"History live while connected"
+    await ctl.push(v3_channel_frame(0, live).hex())
+    await asyncio.sleep(0.5)
+
+    seen_live = False
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 4:
+        p = await x.recv(1)
+        if p is None:
+            break
+        if is_channel_frame(p) and live in p:
+            seen_live = True
+            break
+    await ctl.close()
+    if seen_live:
+        ok("the pushed frame reached the connected client as a live broadcast")
+    else:
+        fail("the connected client never saw the pushed frame live")
+
+    replayed = await drain_history_until_no_more(x)
+    await x.close()
+
+    if any(before in f for f in replayed):
+        ok(f"the frame logged before the connection was replayed ({len(replayed)} frames)")
+    else:
+        fail(f"the pre-connection frame was not replayed ({len(replayed)} frames)")
+    if any(live in f for f in replayed):
+        fail("a frame the client had already seen live was replayed back to it")
+    else:
+        ok("the frame it saw live was not replayed back to it")
+
+
+async def test_anonymous_listener_never_replays(proxy_port):
+    log.info("--- Test 21: the anonymous listener never replays history ---")
+    c = await connect_client(port=proxy_port)
+    await c.appstart()
+    seen = []
+    for _ in range(6):
+        p = await c.get_message()
+        if p is None:
+            break
+        if is_channel_frame(p):
+            seen.append(msg_text(p))
+    await c.close()
+
+    leaked = [t for t in seen if "History seed" in t or "History local" in t]
+    if leaked:
+        fail(f"anonymous listener replayed logged history: {leaked[:2]}")
+    else:
+        ok(f"anonymous listener replayed nothing from the log ({len(seen)} live frames seen)")
+
+
 # --- Harness ---
 
 fake_proc = None
@@ -1044,6 +1279,7 @@ fake_port = None
 control_port = None
 proxy_port = None
 proxy_proc = None
+proxy_args = None
 
 async def start_fake(port=None):
     global fake_proc, fake_pid, fake_port, control_port
@@ -1081,8 +1317,52 @@ async def stop_fake():
     fake_proc = None
     fake_pid = None
 
+
+async def _pipe_reader(stream, prefix):
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        log.info("%s %s", prefix, line.decode("utf-8", "replace").rstrip())
+
+
+async def spawn_proxy():
+    """Start the proxy with the suite's arguments, waiting until it listens.
+
+    Used to restart it as well, always against the same data directory: the
+    history cursor is expected to survive a restart, which is what makes the
+    per-listener kv_store entry worth persisting.
+    """
+    global proxy_proc
+    proxy_proc = await asyncio.create_subprocess_exec(
+        *proxy_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    log.info("Proxy started (PID=%d)", proxy_proc.pid)
+    asyncio.create_task(_pipe_reader(proxy_proc.stdout, "[proxy:out]"))
+    asyncio.create_task(_pipe_reader(proxy_proc.stderr, "[proxy:err]"))
+
+    if not await wait_for_port(proxy_port):
+        log.error("Proxy no responde en puerto %d", proxy_port)
+        return False
+    log.info("Proxy ready on port %d", proxy_port)
+    return True
+
+
+async def stop_proxy():
+    global proxy_proc
+    if proxy_proc and proxy_proc.returncode is None:
+        proxy_proc.terminate()
+        try:
+            await asyncio.wait_for(proxy_proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proxy_proc.kill()
+            await proxy_proc.wait()
+    proxy_proc = None
+
 async def main():
-    global PASS, FAIL, proxy_proc, proxy_port
+    global PASS, FAIL, proxy_proc, proxy_port, proxy_args
 
     DATA_DIR = f"/tmp/cs_test_proxy/{os.getpid()}"
     subprocess.run(["rm", "-rf", DATA_DIR], check=False)
@@ -1091,38 +1371,24 @@ async def main():
         return
 
     proxy_port = await find_free_port()
+    history_port = await find_free_port()
 
     proxy_bin = os.path.join(
         os.path.dirname(__file__), "..", "target", "debug", "coresplitter"
     )
-    proxy_proc = await asyncio.create_subprocess_exec(
+    proxy_args = [
         proxy_bin,
         "--tcp-backend-host", "127.0.0.1",
         "--tcp-backend-port", str(fake_port),
         "--tcp-frontend-port", str(proxy_port),
+        # A named listener: single-client slot with a resumable history.
+        "--listen", f"history:{history_port}",
         "--data-dir", DATA_DIR,
         "--log-level", "info",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-
-    )
-    log.info("Proxy started (PID=%d)", proxy_proc.pid)
-
-    async def _pipe_reader(stream, prefix):
-        while True:
-            line = await stream.readline()
-            if not line:
-                break
-            log.info("%s %s", prefix, line.decode("utf-8", "replace").rstrip())
-    asyncio.create_task(_pipe_reader(proxy_proc.stdout, "[proxy:out]"))
-    asyncio.create_task(_pipe_reader(proxy_proc.stderr, "[proxy:err]"))
-
-    ok = await wait_for_port(proxy_port)
-    if not ok:
-        log.error("Proxy no responde en puerto %d", proxy_port)
+    ]
+    if not await spawn_proxy():
         await stop_fake()
         return
-    log.info("Proxy ready on port %d", proxy_port)
 
     await test_multi_client(proxy_port)
     await test_set_channel(proxy_port)
@@ -1139,6 +1405,12 @@ async def main():
     await test_channel_data_fans_out(proxy_port, control_port)
     await test_setter_invalidates_device_info(proxy_port, control_port)
     await test_ack_routes_past_in_flight_request(proxy_port, control_port)
+    await test_history_replay(history_port, control_port)
+    await test_history_resume(history_port, control_port)
+    await test_history_survives_restart(history_port, control_port)
+    await test_history_records_local_sends(history_port)
+    await test_history_excludes_live_frames(history_port, control_port)
+    await test_anonymous_listener_never_replays(proxy_port)
 
     total = PASS + FAIL
     log.info("=" * 40)
@@ -1147,12 +1419,7 @@ async def main():
     else:
         log.error("RESULT: %d/%d PASS, %d FAIL", PASS, total, FAIL)
 
-    if proxy_proc:
-        proxy_proc.terminate()
-        try:
-            await asyncio.wait_for(proxy_proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            proxy_proc.kill()
+    await stop_proxy()
     await stop_fake()
 
 if __name__ == "__main__":

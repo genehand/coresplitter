@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let config = cli.into_config();
+    let config = cli.into_config()?;
     let mut core = core::Core::new(config, shutdown_rx).await?;
     core.run().await
 }
