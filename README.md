@@ -35,7 +35,9 @@ the physical radio — the proxy acts as a **faithful mirror**.
 4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG): after the radio
    accepts the forward, a synthetic CONTACT_MSG_RECV / CHANNEL_MSG_RECV
    is echoed to the other clients so they see the message as if it
-   had arrived over LoRa, and logged for later history replay. If the
+   had arrived over LoRa (channel text is echoed with the radio's
+   `"<name>: "` sender prefix, exactly as `BaseChatMesh::sendGroupMessage`
+   writes it on air), and logged for later history replay. If the
    radio is unreachable the originator gets an ERROR and nothing is
    echoed or persisted.
 5. Incoming LoRa traffic: the radio pushes MESSAGES_WAITING (0x83) to

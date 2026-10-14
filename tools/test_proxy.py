@@ -1197,6 +1197,15 @@ async def test_history_records_local_sends(history_port):
     else:
         first = msg_text(frames[0])[:30] if frames else "none"
         fail(f"a locally sent message never reached the history (first frame {first!r})")
+        return
+
+    # The radio prefixes every channel text with "<node_name>: " on air, and a
+    # client recovers the sender from that prefix. An echo without it renders as
+    # the whole message being the sender's name, with an empty body.
+    if msg_text(frames[0]).startswith("FakeRadio: "):
+        ok("the replayed echo carries the radio's '<name>: ' sender prefix")
+    else:
+        fail(f"the replayed echo has no sender prefix: {msg_text(frames[0])[:40]!r}")
 
 
 async def test_history_excludes_live_frames(history_port, control_port):

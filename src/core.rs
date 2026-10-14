@@ -1115,7 +1115,15 @@ impl Core {
         let from_key = &pk[..6];
         let channel = payload[2] as i64;
         let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
-        let text = String::from_utf8_lossy(&payload[7..]).to_string();
+        // The radio writes `"<node_name>: "` in front of every channel text it
+        // puts on air (BaseChatMesh::sendGroupMessage), and apps recover the
+        // sender from that prefix. Echoing the text bare makes a client read the
+        // whole message as a sender name with an empty body.
+        let text = format!(
+            "{}: {}",
+            self.radio_name.as_deref().unwrap_or(""),
+            String::from_utf8_lossy(&payload[7..])
+        );
 
         let mut fake = Vec::with_capacity(11 + text.len());
         fake.push(0x11);

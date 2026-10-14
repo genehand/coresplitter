@@ -340,7 +340,19 @@ impl NodeState {
             .map(i64::from_le_bytes))
     }
 
+    /// Persist a listener's replay cursor.
+    ///
+    /// Cursors only ever move forward, and every client on a listener writes
+    /// the same key. A stale writer — the reaper retiring a client that has
+    /// already gone away, or shutdown flushing several entries for one listener
+    /// in arbitrary order — must therefore not drag the cursor back to a frame
+    /// the listener has already consumed.
     pub async fn set_history_cursor(&self, listener: &str, id: i64) -> Result<()> {
+        if let Some(current) = self.history_cursor(listener).await?
+            && current >= id
+        {
+            return Ok(());
+        }
         self.kv_set(&history_cursor_key(listener), &id.to_le_bytes())
             .await
     }
@@ -509,6 +521,21 @@ mod tests {
         state.set_history_cursor("phone", 43).await.unwrap();
         assert_eq!(state.history_cursor("phone").await.unwrap(), Some(43));
         assert_eq!(state.history_cursor("tablet").await.unwrap(), Some(7));
+    }
+
+    /// A listener's clients share one cursor, and the reaper can flush a client
+    /// that went away after a later client already advanced it. Writing its
+    /// older position back would replay frames the listener already consumed.
+    #[tokio::test]
+    async fn history_cursor_never_moves_backwards() {
+        let (state, _) = test_state("cursor-monotonic").await;
+
+        state.set_history_cursor("phone", 43).await.unwrap();
+        state.set_history_cursor("phone", 12).await.unwrap();
+        assert_eq!(state.history_cursor("phone").await.unwrap(), Some(43));
+
+        state.set_history_cursor("phone", 44).await.unwrap();
+        assert_eq!(state.history_cursor("phone").await.unwrap(), Some(44));
     }
 
     /// A deployment upgrading from before the history feature must not keep
