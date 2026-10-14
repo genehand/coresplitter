@@ -40,10 +40,25 @@ the physical radio — the proxy acts as a **faithful mirror**.
 5. Incoming LoRa traffic: the radio pushes MESSAGES_WAITING (0x83) to
    every client; the first one to poll with GET_MSG retrieves the
    frame and the proxy fans it out to the rest, so every client sees
-   inbound messages even though only one poll consumed it.
+   inbound messages even though only one poll consumed it. This covers
+   text messages (0x07/0x08 and the V3 forms 0x10/0x11) and group
+   datagrams (CHANNEL_DATA_RECV 0x1B).
 6. Push events from the radio (ADVERTISEMENT, NEW_ADVERT, LOG_DATA,
-   ...) go to everybody. Late LoRa-delivery ACKs (0x82) are routed
-   back to the original sender by `ack_code`.
+   RAW_DATA, CONTROL_DATA, CONTACT_DELETED, CONTACTS_FULL, ...) go to
+   everybody. Late LoRa-delivery ACKs (0x82) are routed back to the
+   original sender by `ack_code`.
+
+### Protocol version negotiation
+
+The radio's `app_target_ver` (set by `CMD_DEVICE_QUERY`) is radio-global
+and sticky: it selects whether messages are delivered as the legacy
+frames (0x07/0x08) or the V3 frames (0x10/0x11), for every client at
+once. Since the proxy multiplexes many clients onto one radio
+connection, it claims that negotiation itself — it sends
+`CMD_DEVICE_QUERY` with an explicit version at startup (see
+`APP_TARGET_VER` in `src/core.rs`) and serves every client's own
+`CMD_DEVICE_QUERY` from the cached DEVICE_INFO blob. That way no client
+can flip the frame format out from under the others.
 
 ## Requirements
 
@@ -142,7 +157,7 @@ uv run tools/test_proxy.py
 All tests run sequentially. Each cycle spawns a fresh proxy and fake radio,
 runs the tests, and cleans up.
 
-### Current tests (10 cases, 17 assertions, all PASS)
+### Current tests (15 cases, 35 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -156,6 +171,11 @@ runs the tests, and cleans up.
 | 8 | Contact send (0x02) | Two clients: one sends SEND_MSG, the other receives the raw payload broadcast |
 | 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
 | 10 | TCP reconnection | Kills fake radio, waits for reconnect, verifies GET_CHANNEL works |
+| 11 | DEVICE_QUERY negotiation | The proxy pins `app_target_ver` and serves clients' DEVICE_QUERY from cache, so no client re-negotiates the frame format for the others |
+| 12 | Unsolicited pushes | 0x84/0x8E/0x8F/0x90 reach an idle client and do not terminate another client's in-flight request |
+| 13 | CHANNEL_DATA_RECV fan-out | A 0x1B group datagram polled by one client is fanned out to the rest |
+| 14 | Setter cache invalidation | SET_PATH_HASH_MODE (0x3D) invalidates the cached DEVICE_INFO instead of leaving it stale |
+| 15 | ACK routing | A late 0x82 ACK reaches its original sender even while another client's request is in flight |
 
 ### Fake radio
 
@@ -169,6 +189,13 @@ uv run tools/fake_radio.py --port 5050 --inject
 # Serial PTY mode
 uv run tools/fake_radio.py --serial
 ```
+
+`--control-port` exposes a newline-delimited control channel so tests can
+drive the radio deterministically instead of racing the periodic
+injector (`delay <ms>`, `hold <hexcode>`, `release`, `push <hex>`,
+`queue <hex>`, `appver`, `stats`). The suite uses it to pin a request
+in-flight while it fires unsolicited pushes, and to assert the
+negotiated protocol version.
 
 ## Container
 
@@ -184,4 +211,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 17/17 PASS (10 cases) on TCP backend against fake radio
+- **Tests**: 35/35 PASS (15 cases) on TCP backend against fake radio

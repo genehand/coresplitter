@@ -16,22 +16,61 @@ use crate::protocol::decode::{
 
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Protocol version the proxy advertises to the radio as `app_target_ver` in
+/// CMD_DEVICE_QUERY. The firmware only branches on `app_target_ver >= 3`
+/// (`MyMesh.cpp`: `queueMessage` and `onChannelMessageRecv`), which selects the
+/// V3 message frames (RESP_CODE_CONTACT_MSG_RECV_V3 0x10 /
+/// RESP_CODE_CHANNEL_MSG_RECV_V3 0x11) over the legacy forms (0x07/0x08).
+///
+/// 13 matches FIRMWARE_VER_CODE on MeshCore 1.16.0+, which is the version this
+/// proxy reports verbatim to clients inside the cached DEVICE_INFO blob. Pinning
+/// it keeps that consistent: clients told "firmware 13" get V3 frames. Before
+/// this was pinned the radio's `app_target_ver` was whatever the first client to
+/// slip past the cache sent, so the frame type a client saw depended on which
+/// other client connected first.
+const APP_TARGET_VER: u8 = 13;
+
 /// Maximum age of a pending_acks entry before it is considered abandoned.
 /// LoRa retransmissions inside the radio top out around ~30 s; five minutes
 /// is comfortably above any realistic real ACK and short enough to bound
 /// memory growth from channel sends (which never produce an ACK).
 const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 
-/// Response codes that are spontaneous push events from the radio and never
-/// complete an in-flight request. They are always broadcast to every client.
-/// ACK (0x82) is also a push from the in_flight slot's point of view but
-/// has its own dedicated routing via `pending_acks`.
+/// Response codes that are spontaneous pushes from the radio and never complete
+/// an in-flight request. They are always broadcast to every client.
+///
+/// Because `Awaiting::Any` completes on *any* code not listed here, this list is
+/// load-bearing: a missing unsolicited code gets delivered to whichever client
+/// happens to have a request in flight and terminates it early, robbing every
+/// other client of the frame.
+///
+/// Only list codes the radio emits *without* a corresponding command. The
+/// borderline cases, checked against MeshCore 1.17.1 `MyMesh.cpp`:
+///
+/// * `0x84` RAW_DATA and `0x8E` CONTROL_DATA are inbound-only. The outbound
+///   commands (`CMD_SEND_RAW_DATA` 0x19, `CMD_SEND_CONTROL_DATA` 0x37) are
+///   answered with a plain OK, so these codes never belong to a request.
+/// * `0x85`/`0x86` LOGIN_*, `0x87` STATUS_RESPONSE, `0x8B` TELEMETRY_RESPONSE,
+///   `0x8C` BINARY_RESPONSE, `0x8D` PATH_DISCOVERY_RESPONSE and `0x89`
+///   TRACE_DATA look like pushes but are replies the app correlates with a
+///   command it sent (often by matching a tag). Listing any of them would hang
+///   that command forever.
+/// * `0x82` ACK is listed so `try_route_to_in_flight` declines it and control
+///   falls through to `try_route_ack`, which routes it to the client that is
+///   waiting on that `ack_code`. Without this the ACK is eaten by whatever
+///   unrelated request happens to be in flight.
 const PUSH_EVENT_CODES: &[u8] = &[
-    0x80, // ADVERTISEMENT
-    0x81, // PATH_UPDATE
-    0x83, // MESSAGES_WAITING
-    0x88, // LOG_DATA
-    0x8A, // NEW_ADVERT
+    0x80, // ADVERTISEMENT           (push)
+    0x81, // PATH_UPDATE             (push)
+    0x82, // ACK / SEND_CONFIRMED    (routed via pending_acks)
+    0x83, // MESSAGES_WAITING        (push 'tickle')
+    0x84, // RAW_DATA                (push, onRawDataRecv)
+    0x88, // LOG_DATA                (push)
+    0x8A, // NEW_ADVERT              (push)
+    0x8E, // CONTROL_DATA            (push, onControlDataRecv)
+    0x8F, // CONTACT_DELETED         (push, onContactOverwrite)
+    0x90, // CONTACTS_FULL           (push, onContactsFull)
 ];
 
 fn is_push_event(code: u8) -> bool {
@@ -422,8 +461,19 @@ impl Core {
         // Wait for SELF_INFO (0x05) from the radio
         self.wait_for_self_info().await?;
 
-        // Query device info to learn radio capabilities (max_channels, etc.)
-        let device_query = vec![0x16];
+        // Query device info to learn radio capabilities (max_channels, etc.).
+        //
+        // The second byte is `app_target_ver`. The firmware ignores this
+        // command entirely unless `len >= 2` (MyMesh.cpp: `CMD_DEVICE_QUERY &&
+        // len >= 2`), replying ERR_CODE_UNSUPPORTED_CMD instead -- which would
+        // leave `device_info_raw` empty. That matters for more than caching:
+        // `app_target_ver` is a single radio-global, sticky variable that
+        // selects RESP_CODE_CONTACT_MSG_RECV (0x07/0x08) versus the V3 forms
+        // (0x10/0x11) for *every* client. Claiming it here means the proxy owns
+        // that negotiation, so a client's own DEVICE_QUERY is served from cache
+        // (see `try_serve_from_cache`) and can never flip the frame format out
+        // from under the other clients.
+        let device_query = vec![0x16, APP_TARGET_VER];
         self.send_to_radio(&device_query).await?;
 
         self.wait_for_device_info().await?;
@@ -677,8 +727,19 @@ impl Core {
                 let idx = payload[1] as i64;
                 let _ = self.state.delete_channel(idx).await;
             }
-            // Setters that mutate SELF_INFO / DEVICE_INFO / BATTERY.
-            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 => {
+            // Setters that mutate a cached blob. Clearing it means the next
+            // client to ask re-reads from the radio, which is how the cache
+            // converges after any write.
+            //
+            //   SELF_INFO:   0x08 name, 0x0B radio+tuning, 0x0C tx power,
+            //                0x0E coords, 0x15 tuning, 0x26 other params,
+            //                0x33 factory reset
+            //   DEVICE_INFO: 0x25 BLE pin, 0x0B repeat flag, 0x3D path hash
+            //                mode, 0x33 factory reset
+            //
+            // 0x3D is easy to miss: CMD_SET_PATH_HASH_MODE writes byte 81 of
+            // DEVICE_INFO (verified against MeshCore 1.17.1 MyMesh.cpp:1459).
+            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 | 0x3D => {
                 self.self_info_raw = None;
                 self.device_info_raw = None;
                 self.battery_info_raw = None;
@@ -984,10 +1045,14 @@ impl Core {
         }
 
         // An incoming LoRa message delivered as the reply to a GET_MSG is
-        // a global event from the rest of the network's point of view:
-        // every connected client should see it. Fan out to the other
-        // clients (the originator just got it through send_to_client).
-        if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11) {
+        // a global event from the rest of the network's point of view: the
+        // radio only hands it out once (it is popped from the offline queue),
+        // so every other connected client must be given a copy or it would
+        // never see the message at all. The originator already got it through
+        // send_to_client above. 0x1B (CHANNEL_DATA_RECV) belongs in this set
+        // because it is likewise a CMD_SYNC_NEXT_MESSAGE (0x0A) reply carrying
+        // an inbound group datagram.
+        if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
             self.broadcast_to_others(client_id.as_ref(), payload);
         }
 
