@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio::time;
 
 use crate::protocol::frame::{self, FrameParser};
 
@@ -30,6 +32,10 @@ impl std::fmt::Display for ClientId {
 pub struct ClientCommand {
     pub client_id: ClientId,
     pub payload: Vec<u8>,
+    /// Peer that sent the command. Only logging reads it, but it is what tells
+    /// one device reconnecting in a burst (several ids, one address) apart from
+    /// several devices on one listener.
+    pub addr: SocketAddr,
     /// Listener that accepted this client. Only history replay reads it;
     /// routing, caching and the in-flight slot are shared across listeners.
     pub listener: Arc<ListenerProfile>,
@@ -71,6 +77,7 @@ pub struct TcpFrontend {
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     direct_map: ClientDirectMap,
     shutdown_rx: watch::Receiver<bool>,
+    client_idle_timeout: Duration,
 }
 
 impl TcpFrontend {
@@ -80,6 +87,7 @@ impl TcpFrontend {
         broadcast_tx: broadcast::Sender<Vec<u8>>,
         direct_map: ClientDirectMap,
         shutdown_rx: watch::Receiver<bool>,
+        client_idle_timeout: Duration,
     ) -> Self {
         Self {
             listeners,
@@ -87,6 +95,7 @@ impl TcpFrontend {
             broadcast_tx,
             direct_map,
             shutdown_rx,
+            client_idle_timeout,
         }
     }
 
@@ -107,6 +116,7 @@ impl TcpFrontend {
             let direct_map = self.direct_map.clone();
             let shutdown_rx = self.shutdown_rx.clone();
             let profile = Arc::new(profile.clone());
+            let client_idle_timeout = self.client_idle_timeout;
             tokio::spawn(async move {
                 if let Err(e) = accept_loop(
                     listener,
@@ -115,6 +125,7 @@ impl TcpFrontend {
                     broadcast_tx,
                     direct_map,
                     shutdown_rx,
+                    client_idle_timeout,
                 )
                 .await
                 {
@@ -144,6 +155,7 @@ async fn accept_loop(
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     direct_map: ClientDirectMap,
     mut shutdown_rx: watch::Receiver<bool>,
+    client_idle_timeout: Duration,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -154,7 +166,15 @@ async fn accept_loop(
                 let direct_map = direct_map.clone();
                 let profile = profile.clone();
                 tracing::info!(addr = %addr, listener = %profile.label(), "spawning client handler");
-                tokio::spawn(handle_client(stream, addr, command_tx, broadcast_rx, direct_map, profile));
+                tokio::spawn(handle_client(
+                    stream,
+                    addr,
+                    command_tx,
+                    broadcast_rx,
+                    direct_map,
+                    profile,
+                    client_idle_timeout,
+                ));
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -172,6 +192,7 @@ async fn handle_client(
     mut broadcast_rx: broadcast::Receiver<Vec<u8>>,
     direct_map: ClientDirectMap,
     listener: Arc<ListenerProfile>,
+    client_idle_timeout: Duration,
 ) {
     let client_id = ClientId::new();
     tracing::info!(client = %client_id, addr = %addr, listener = %listener.label(), "client connected");
@@ -187,11 +208,38 @@ async fn handle_client(
     // The read task needs the listener profile to tag each command with; the
     // write task and the trailing log keep their own handle.
     let read_listener = listener.clone();
-    let read_handle = tokio::spawn(async move {
+    let mut read_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
 
         loop {
-            match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
+            // A companion client polls (battery every 120 s, message sync on
+            // demand), so a socket that has said nothing for the idle timeout
+            // is gone even though no FIN ever arrived. Only reads are timed:
+            // a client is idle when it stops *sending*.
+            let read = if client_idle_timeout.is_zero() {
+                tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await
+            } else {
+                match time::timeout(
+                    client_idle_timeout,
+                    tokio::io::AsyncReadExt::read(&mut reader, &mut buf),
+                )
+                .await
+                {
+                    Ok(read) => read,
+                    Err(_) => {
+                        tracing::info!(
+                            client = %client_id,
+                            addr = %addr,
+                            listener = %read_listener.label(),
+                            timeout_secs = client_idle_timeout.as_secs(),
+                            "client idle timeout, closing connection"
+                        );
+                        break;
+                    }
+                }
+            };
+
+            match read {
                 Ok(0) => break,
                 Ok(n) => {
                     let frames = parser.feed(&buf[..n]);
@@ -204,6 +252,7 @@ async fn handle_client(
                         let cmd = ClientCommand {
                             client_id,
                             payload,
+                            addr,
                             listener: read_listener.clone(),
                         };
                         if command_tx.send(cmd).is_err() {
@@ -219,7 +268,7 @@ async fn handle_client(
         }
     });
 
-    let write_handle = tokio::spawn(async move {
+    let mut write_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 Some(payload) = direct_rx.recv() => {
@@ -244,9 +293,21 @@ async fn handle_client(
         }
     });
 
-    tokio::select! {
-        _ = read_handle => {},
-        _ = write_handle => {},
+    // Whichever half ends first, abort the other so *both* halves of the
+    // socket are dropped: a reaped client that could still be written to (the
+    // write task holds a broadcast subscription) would defeat the whole point.
+    // Await the aborted half only -- the winner was already polled to
+    // completion by `select!`, and polling a finished JoinHandle panics.
+    let read_finished = tokio::select! {
+        _ = &mut read_handle => true,
+        _ = &mut write_handle => false,
+    };
+    if read_finished {
+        write_handle.abort();
+        let _ = write_handle.await;
+    } else {
+        read_handle.abort();
+        let _ = read_handle.await;
     }
 
     direct_map.lock().unwrap().remove(&client_id);

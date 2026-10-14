@@ -231,6 +231,10 @@ MSG_CODES = CONTACT_MSG_CODES + CHANNEL_MSG_CODES
 # Byte offset of the UTF-8 text in each message frame.
 _TEXT_OFFSET = {0x07: 13, 0x10: 16, 0x08: 8, 0x11: 11}
 
+# Mirrors MAX_GROUP_CHANNELS in tools/fake_radio.py, which the radio reports as
+# byte 3 of DEVICE_INFO. `BaseChatMesh::getChannel` refuses idx >= this value.
+MAX_GROUP_CHANNELS = 40
+
 
 def msg_text(p: bytes) -> str:
     """Extract the message body from a message frame of either generation."""
@@ -1359,6 +1363,123 @@ async def test_late_reply_is_not_misattributed(proxy_port, control_port):
     await ctl.close()
 
 
+async def test_client_idle_timeout():
+    """Test 23: a silent client is reaped, a polling one is not.
+
+    A suspended phone never sends a FIN, so the frontend has to conclude a
+    client is gone from silence alone. The rule has to be idle-based rather
+    than a connection age cap: a client that keeps polling must outlive it.
+    """
+    log.info("--- Test 23: idle timeout reaps silent clients only ---")
+    port = await find_free_port()
+    data_dir = f"/tmp/cs_test_proxy/{os.getpid()}/idle"
+    subprocess.run(["rm", "-rf", data_dir], check=False)
+    proc = await asyncio.create_subprocess_exec(
+        proxy_args[0],
+        "--tcp-backend-host", "127.0.0.1",
+        "--tcp-backend-port", str(fake_port),
+        "--tcp-frontend-port", str(port),
+        "--data-dir", data_dir,
+        "--log-level", "info",
+        "--client-idle-timeout", "2",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        if not await wait_for_port(port):
+            fail("idle-timeout proxy did not start")
+            return
+
+        idle = await connect_client(port=port)
+        busy = await connect_client(port=port)
+        await busy.appstart()
+
+        idle_closed = False
+        busy_alive = True
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 8:
+            # CURRENT_TIME keeps `busy` off the idle list while `idle` is mute.
+            await busy.send(b"\x05")
+            if await busy.recv(1.0) is None:
+                busy_alive = False
+                break
+            if await idle.recv(0.1) is None:
+                idle_closed = True
+                break
+
+        await idle.close()
+        await busy.close()
+
+        if not idle_closed:
+            fail("the silent client was never reaped")
+        elif not busy_alive:
+            fail("the polling client was reaped too: the sweep is not idle-based")
+        else:
+            ok("the silent client was closed while the polling one survived")
+    finally:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+
+async def test_get_channel_out_of_range_is_local(proxy_port, control_port):
+    """Test 24: only *provably* doomed GET_CHANNELs are answered locally.
+
+    `BaseChatMesh::getChannel` refuses every idx >= MAX_GROUP_CHANNELS, so the
+    radio can only answer ERR_CODE_NOT_FOUND for those. Forwarding one burns
+    the single in-flight slot on an outcome already known, which is what makes
+    an app walk its way to "no more channels" expensive.
+
+    The other half of the boundary matters just as much: idx below the bound
+    must still reach the cache (or the radio, on a cache miss), because a
+    refused idx there would hide a channel the app is supposed to see.
+    """
+    log.info("--- Test 24: out-of-range GET_CHANNEL is answered locally ---")
+    ctl = await connect_control(control_port)
+    before = (await ctl.stats())["cmd_counts"].get("0x1f", 0)
+
+    c = await connect_client(port=proxy_port)
+    await c.appstart()
+
+    async def request(idx):
+        await c.send(b"\x1f" + bytes([idx]))
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 3:
+            p = await c.recv(1)
+            if p is None:
+                return None
+            # Skip the injector's unsolicited MESSAGES_WAITING.
+            if len(p) and p[0] in (0x01, 0x12):
+                return p
+        return None
+
+    in_range = await request(MAX_GROUP_CHANNELS - 1)  # 39: last real slot
+    boundary = await request(MAX_GROUP_CHANNELS)  # 40: the boundary itself
+    past = await request(255)  # far past
+    await c.close()
+
+    after = (await ctl.stats())["cmd_counts"].get("0x1f", 0)
+    await ctl.close()
+
+    if in_range is None or in_range[0] != 0x12:
+        # Answering this one locally as NOT_FOUND would hide a real channel.
+        fail(f"in-range idx {MAX_GROUP_CHANNELS - 1} must still answer "
+             f"CHANNEL_INFO (0x12), got {in_range!r}")
+    elif boundary is None or len(boundary) < 2 or boundary[1] != 0x02:
+        fail(f"idx {MAX_GROUP_CHANNELS} should be a local ERR_CODE_NOT_FOUND "
+             f"(0x01 0x02), got {boundary!r}")
+    elif past is None or len(past) < 2 or past[1] != 0x02:
+        fail(f"idx 255 should be a local ERR_CODE_NOT_FOUND (0x01 0x02), got {past!r}")
+    elif after != before:
+        fail(f"GET_CHANNEL reached the radio for an idx the cache or the "
+             f"boundary already settled ({before} -> {after})")
+    else:
+        ok("only idx >= max_channels is answered locally (0x01 0x02), radio untouched")
+
+
 # --- Harness ---
 
 fake_proc = None
@@ -1503,6 +1624,8 @@ async def main():
     await test_history_excludes_live_frames(history_port, control_port)
     await test_anonymous_listener_never_replays(proxy_port)
     await test_late_reply_is_not_misattributed(proxy_port, control_port)
+    await test_client_idle_timeout()
+    await test_get_channel_out_of_range_is_local(proxy_port, control_port)
 
     total = PASS + FAIL
     log.info("=" * 40)

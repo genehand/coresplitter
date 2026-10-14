@@ -207,6 +207,10 @@ pub struct CoreConfig {
     /// How long a client request may occupy the in-flight slot before it is
     /// failed with ERROR. See `--in-flight-timeout`.
     pub in_flight_timeout: Duration,
+    /// How long a client connection may go without sending a command before
+    /// the frontend closes it. Zero disables the sweep. See
+    /// `--client-idle-timeout`.
+    pub client_idle_timeout: Duration,
     pub data_dir: PathBuf,
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
@@ -375,6 +379,7 @@ impl Core {
             self.broadcast_tx.clone(),
             self.client_channels.clone(),
             shutdown_rx,
+            self.config.client_idle_timeout,
         );
         tokio::spawn(async move {
             if let Err(e) = frontend.run().await {
@@ -802,6 +807,20 @@ impl Core {
                 } else {
                     -1
                 };
+                // `BaseChatMesh::getChannel` refuses every idx >= MAX_GROUP_CHANNELS,
+                // so the radio can only answer ERR_CODE_NOT_FOUND for these. Reply
+                // it here and keep a doomed request off the single in-flight slot.
+                // (An in-range but empty slot is a different case: the radio may
+                // still hold a channel the cache has not seen, so that forwards.)
+                if requested_idx >= i64::from(self.max_channels) {
+                    tracing::debug!(
+                        idx = requested_idx,
+                        max_channels = self.max_channels,
+                        "GET_CHANNEL out of range, replying locally"
+                    );
+                    self.send_to_client(&cmd.client_id, vec![0x01, 0x02]);
+                    return true;
+                }
                 if let Ok(channels) = self.state.get_channels().await
                     && let Some(ch) = channels.iter().find(|c| c.idx == requested_idx)
                 {
@@ -840,14 +859,23 @@ impl Core {
         // has not consumed. Say so instead of leaving it mysterious. Only live
         // clients count: the reaper runs on the 1 s tick, so a just-departed
         // client may still have an entry.
-        let listener_taken = self
+        //
+        // The address matters: when the same device shows up with several
+        // client ids it is one app reconnecting in a burst (an auto-reconnect
+        // racing a manual Connect tap, typically), not two devices. Naming the
+        // existing clients and the peer is what makes that legible.
+        let others: Vec<ClientId> = self
             .history_sync
             .iter()
-            .any(|(client, sync)| sync.listener == listener && self.client_is_alive(client));
-        if listener_taken {
+            .filter(|(client, sync)| sync.listener == listener && self.client_is_alive(client))
+            .map(|(client, _)| *client)
+            .collect();
+        if !others.is_empty() {
             tracing::warn!(
                 listener = %listener,
                 client = %cmd.client_id,
+                addr = %cmd.addr,
+                existing = ?others,
                 "second client on a single-client listener: it shares that \
                  listener's history cursor"
             );

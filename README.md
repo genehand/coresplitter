@@ -30,6 +30,10 @@ the physical radio — the proxy acts as a **faithful mirror**.
    DEVICE_INFO, BATTERY, GET_CONTACTS, GET_CHANNEL); the rest are
    serialized through a FIFO queue and forwarded one at a time to the
    radio. The radio's reply is routed back to the originating client.
+   `GET_CHANNEL` past the radio's `max_channels` is never forwarded: the
+   firmware's `getChannel` refuses every such idx, so the locally-known
+   NOT_FOUND answer keeps an app's walk to the end of the channel list
+   off the radio's single in-flight slot.
    If the radio disconnects, any in-flight or queued client request is
    failed immediately with ERROR. A request the radio answers too late to
    beat `--in-flight-timeout` is failed the same way, and the reply that
@@ -85,7 +89,10 @@ coresplitter \
   local store.
 - Give every device its own name. Two clients on one name share a
   cursor: the newcomer gets whatever the first has not consumed, and
-  the proxy logs a warning when it sees it happen.
+  the proxy logs a warning (with the peer address and the client ids
+  already on that name) when it sees it happen. The same address
+  appearing under several ids is one app reconnecting in a burst — an
+  auto-reconnect racing a manual Connect tap — not several devices.
 - Only channel messages are replayed. Contact frames are logged but not
   replayed, because the V3 contact form carries a variable-length
   sender prefix for signed messages.
@@ -93,6 +100,18 @@ coresplitter \
   once a minute, measured on the proxy's clock rather than the sender's
   (LoRa timestamps come from the sender's RTC and can be skewed or
   zero). `0` keeps no history at all.
+
+### Client liveness
+
+A companion talks just to keep the link honest — the reference client
+polls battery every 120 s and syncs messages whenever the UI asks. When
+a phone suspends (screen lock) its OS may never send a FIN, so the
+proxy would otherwise keep serving a half-open socket forever and count
+it as a live client on that listener. `--client-idle-timeout` (default
+600 s, `0` disables) closes a connection that has sent nothing for that
+long, so a reconnecting client takes over a slot instead of stacking on
+top of a socket nobody is reading. The sweep is idle-based, not a
+connection age cap: a client that keeps polling outlives it.
 
 ### Protocol version negotiation
 
@@ -203,6 +222,7 @@ All the flags above have `CORESPLITTER_*` equivalents:
 | `CORESPLITTER_DATA_DIR` | Data directory (default: ./data) |
 | `CORESPLITTER_MESSAGE_HISTORY_HOURS` | Message-history retention in hours (default: 24; 0 keeps none) |
 | `CORESPLITTER_IN_FLIGHT_TIMEOUT` | Seconds to wait for the radio's reply to one command before failing it with ERROR (default: 15) |
+| `CORESPLITTER_CLIENT_IDLE_TIMEOUT` | Seconds of client silence before the frontend closes the connection (default: 600; 0 disables) |
 | `CORESPLITTER_LISTEN` | Named listeners, comma-separated `NAME:PORT[:HOURS]` |
 | `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `CORESPLITTER_LOG_JSON` | Enable JSON event logging |
@@ -223,7 +243,7 @@ All tests run sequentially against one proxy on ephemeral ports, which is
 restarted once by the history tests (same data directory, to prove the
 replayed cursor survives it).
 
-### Current tests (21 cases, 47 assertions, all PASS)
+### Current tests (24 cases, 52 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -249,6 +269,8 @@ replayed cursor survives it).
 | 20 | Live frames not replayed | A frame logged before the client connected is replayed; one it already saw live is not |
 | 21 | Anonymous listener | The unnamed `--tcp-frontend-port` listener never replays history |
 | 22 | Late reply discarded | A reply arriving after the in-flight timeout is dropped instead of answering another client's request |
+| 23 | Client idle timeout | A silent client is reaped while a polling one on the same proxy outlives the sweep |
+| 24 | Out-of-range GET_CHANNEL | Only `idx >= max_channels` is answered locally with NOT_FOUND; idx 39 still reaches the cache and nothing in the test touches the radio |
 
 ### Fake radio
 
@@ -284,4 +306,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 47/47 PASS (21 cases) on TCP backend against fake radio
+- **Tests**: 51/51 PASS (23 cases) on TCP backend against fake radio

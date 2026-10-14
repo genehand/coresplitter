@@ -662,12 +662,23 @@ class FakeRadio:
                 await w.drain()
 
             case 0x1F:
-                idx = rest[0] if rest else 0
-                ch = next((c for c in self.channels if c["idx"] == idx), None)
-                if ch:
-                    w.write(respond_channel_info(idx, ch["name"], ch["psk"]))
+                # Real firmware requires `CMD_GET_CHANNEL && len >= 2` and
+                # otherwise falls through to ERR_CODE_UNSUPPORTED_CMD, and
+                # BaseChatMesh::getChannel refuses every idx outside
+                # [0, MAX_GROUP_CHANNELS) with ERR_CODE_NOT_FOUND. An in-range
+                # slot that was never set still answers CHANNEL_INFO, with an
+                # empty name.
+                if not rest:
+                    w.write(respond_error(1))
+                elif rest[0] >= MAX_GROUP_CHANNELS:
+                    w.write(respond_error(2))
                 else:
-                    w.write(respond_channel_info(idx, ""))
+                    idx = rest[0]
+                    ch = next((c for c in self.channels if c["idx"] == idx), None)
+                    if ch:
+                        w.write(respond_channel_info(idx, ch["name"], ch["psk"]))
+                    else:
+                        w.write(respond_channel_info(idx, ""))
                 await w.drain()
 
             case 0x20:

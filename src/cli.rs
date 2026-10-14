@@ -74,6 +74,17 @@ pub struct Cli {
     #[arg(long, default_value_t = 15, env = "CORESPLITTER_IN_FLIGHT_TIMEOUT")]
     pub in_flight_timeout: u64,
 
+    /// Close a client connection that has sent nothing for this many seconds.
+    ///
+    /// A companion client talks just to keep the link honest: it polls
+    /// battery every 120 s and message sync whenever the UI asks. Silence for
+    /// far longer than that means the client is gone, not quiet -- most often
+    /// a suspended phone whose OS never sent a FIN, so the frontend would
+    /// otherwise keep serving a half-open socket and every reconnect would
+    /// stack another "live" client on the same listener. 0 disables the sweep.
+    #[arg(long, default_value_t = 600, env = "CORESPLITTER_CLIENT_IDLE_TIMEOUT")]
+    pub client_idle_timeout: u64,
+
     /// Extra named TCP listener with a resumable message history, as
     /// NAME:PORT[:HOURS]. Repeatable, or comma-separated in the environment.
     ///
@@ -156,6 +167,7 @@ impl Cli {
             listeners: parsed.into_iter().map(|(profile, _)| profile).collect(),
             message_history_hours: self.message_history_hours,
             in_flight_timeout: Duration::from_secs(self.in_flight_timeout.max(1)),
+            client_idle_timeout: Duration::from_secs(self.client_idle_timeout),
             data_dir: self.data_dir,
             event_log_level,
             event_log_json: self.json,
