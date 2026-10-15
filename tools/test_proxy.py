@@ -1573,6 +1573,64 @@ async def test_get_channel_out_of_range_is_local(proxy_port, control_port):
         ok("only idx >= max_channels is answered locally (0x01 0x02), radio untouched")
 
 
+async def test_client_request_jumps_sync_queue(proxy_port, control_port):
+    """Test 26: a client command does not queue behind the internal sync.
+
+    `sync_from_radio` pushes one request per channel slot (plus the contact
+    list) through the same FIFO as client requests, and the radio answers one
+    command per loop. On a slow link that is seconds of queue, and a client
+    command that falls in behind all of it waits for every entry before the
+    radio even sees it -- even though none of those entries is the work the
+    client asked for.
+
+    `delay` is what makes that queue observable: it is the one control verb
+    that slows the proxy's own sync, which is the condition under test, and it
+    is cleared before returning. A client's non-cacheable request must answer
+    inside a couple of command slots instead of the whole channel list.
+    """
+    log.info("--- Test 26: client requests jump the internal sync queue ---")
+    ctl = await connect_control(control_port)
+    # 400 ms per command: the contacts + channel sync alone is then >16 s, far
+    # past the 3 s window this test gives the client's reply.
+    await ctl.delay(400)
+
+    await stop_proxy()
+    if not await spawn_proxy():
+        fail("proxy did not come back after a restart")
+        await ctl.delay(0)
+        await ctl.close()
+        return
+
+    # The frontend only starts accepting after sync_from_radio has queued the
+    # whole channel list, so a client connecting now is guaranteed to be behind
+    # it. (Jumping the queue is the point, so it must not need a warm cache.)
+    c = await connect_client(port=proxy_port)
+    t0 = time.monotonic()
+    await c.send(b"\x0a")  # CMD_SYNC_NEXT_MESSAGE: never answered from cache
+    reply = None
+    while time.monotonic() - t0 < 3:
+        p = await c.recv(0.5)
+        if p is None:
+            break
+        # Skip the injector's unsolicited MESSAGES_WAITING, which any client
+        # receives at any time.
+        if len(p) and p[0] != 0x83:
+            reply = p
+            break
+    elapsed = time.monotonic() - t0
+    await ctl.delay(0)
+    await c.close()
+    await ctl.close()
+
+    if reply is None:
+        fail(f"client request not answered in 3.0s while the sync queued "
+             f"(the radio was busy with the proxy's own reads)")
+    elif reply[0] == 0x01:
+        fail(f"client request was failed with ERROR instead of being answered: {reply!r}")
+    else:
+        ok(f"client request answered in {elapsed:.2f}s, ahead of the sync queue")
+
+
 # --- Harness ---
 
 fake_proc = None
@@ -1720,6 +1778,7 @@ async def main():
     await test_late_reply_is_not_misattributed(proxy_port, control_port)
     await test_client_idle_timeout()
     await test_get_channel_out_of_range_is_local(proxy_port, control_port)
+    await test_client_request_jumps_sync_queue(proxy_port, control_port)
 
     total = PASS + FAIL
     log.info("=" * 40)

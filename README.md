@@ -24,7 +24,12 @@ the physical radio — the proxy acts as a **faithful mirror**.
 1. Proxy connects to the physical radio and syncs contacts and channels
    into SQLite at startup (and again after each reconnect). The sync
    commands are queued through the same FIFO as client commands so their
-   responses never interleave with a real client request.
+   responses never interleave with a real client request. A client's
+   request still jumps ahead of the entries the sync left queued: the
+   radio answers one command per loop, so a request behind a
+   `1 + max_channels` sync would wait seconds for work it did not ask
+   for. The reads the proxy can serve from cache are the exception — they
+   keep their place, because the sync is filling those very entries.
 2. Opens a TCP server for companion clients to connect to.
 3. Client commands are served from cache when possible (SELF_INFO,
    DEVICE_INFO, BATTERY, GET_CONTACTS, GET_CHANNEL); the rest are
@@ -252,7 +257,7 @@ All tests run sequentially against one proxy on ephemeral ports, which is
 restarted once by the history tests (same data directory, to prove the
 replayed cursor survives it).
 
-### Current tests (24 cases, 52 assertions, all PASS)
+### Current tests (26 cases, 57 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -267,7 +272,7 @@ replayed cursor survives it).
 | 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
 | 10 | TCP reconnection | Kills fake radio, waits for reconnect, verifies GET_CHANNEL works |
 | 11 | DEVICE_QUERY negotiation | The proxy pins `app_target_ver` and serves clients' DEVICE_QUERY from cache, so no client re-negotiates the frame format for the others |
-| 12 | Unsolicited pushes | 0x84/0x8E/0x8F/0x90 reach an idle client and do not terminate another client's in-flight request |
+| 12 | Unsolicited pushes | 0x84/0x8C/0x8D/0x8E/0x8F/0x90 reach an idle client and do not terminate another client's in-flight request |
 | 13 | CHANNEL_DATA_RECV fan-out | A 0x1B group datagram polled by one client is fanned out to the rest |
 | 14 | Setter cache invalidation | SET_PATH_HASH_MODE (0x3D) invalidates the cached DEVICE_INFO instead of leaving it stale |
 | 15 | ACK routing | A late 0x82 ACK reaches its original sender even while another client's request is in flight |
@@ -280,6 +285,8 @@ replayed cursor survives it).
 | 22 | Late reply discarded | A reply arriving after the in-flight timeout is dropped instead of answering another client's request |
 | 23 | Client idle timeout | A silent client is reaped while a polling one on the same proxy outlives the sweep |
 | 24 | Out-of-range GET_CHANNEL | Only `idx >= max_channels` is answered locally with NOT_FOUND; idx 39 still reaches the cache and nothing in the test touches the radio |
+| 25 | CLI invalidation | CMD_RUN_CLI_COMMAND (0x42) clears the cached SELF_INFO/DEVICE_INFO, since the CLI is a second setter path |
+| 26 | Client request jumps the sync queue | With the radio slowed to 400 ms per command, a client's non-cacheable request is answered immediately instead of waiting for the proxy's own contacts/channel sync to drain |
 
 ### Fake radio
 
@@ -315,4 +322,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 51/51 PASS (23 cases) on TCP backend against fake radio
+- **Tests**: 57/57 PASS (26 cases) on TCP backend against fake radio
