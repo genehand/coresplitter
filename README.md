@@ -3,8 +3,10 @@
 [MeshCore](https://meshcore.io) **client multiplexer with cache**. Speaks the
 companion protocol on both sides: it connects to a physical radio (serial,
 BLE, or TCP) and serves a TCP interface to multiple concurrent companion
-clients. Contacts, channels, SELF_INFO, DEVICE_INFO and BATTERY are cached in
-SQLite so cold reads don't hit the radio. Every client sees the same state as
+clients. Channels, SELF_INFO, DEVICE_INFO and BATTERY are cached in SQLite
+so cold reads don't hit the radio. Contacts are deliberately not cached: the
+radio filters `GET_CONTACTS` on the client's own watermark, so a stored copy
+would go stale the moment it could answer a request itself. Every client sees the same state as
 the physical radio — the proxy acts as a **faithful mirror**.
 
 ## How it works
@@ -21,24 +23,38 @@ the physical radio — the proxy acts as a **faithful mirror**.
                        └────────────────┘                    └──────────┘
 ```
 
-1. Proxy connects to the physical radio and syncs contacts and channels
-   into SQLite at startup (and again after each reconnect). The sync
-   commands are queued through the same FIFO as client commands so their
-   responses never interleave with a real client request. A client's
-   request still jumps ahead of the entries the sync left queued: the
-   radio answers one command per loop, so a request behind a
-   `1 + max_channels` sync would wait seconds for work it did not ask
-   for. The reads the proxy can serve from cache are the exception — they
-   keep their place, because the sync is filling those very entries.
+1. Proxy connects to the physical radio and syncs the channel list into
+   SQLite at startup (and again after each reconnect). The sync commands
+   are queued through the same FIFO as client commands so their responses
+   never interleave with a real client request. A client's request still
+   jumps ahead of the entries the sync left queued: the radio answers one
+   command per loop, so a request behind the `max_channels`-long sync
+   would wait seconds for work it did not ask for. The reads the proxy can
+   serve from cache are the exception — they keep their place, because the
+   sync is filling those very entries.
 2. Opens a TCP server for companion clients to connect to.
 3. Client commands are served from cache when possible (SELF_INFO,
-   DEVICE_INFO, BATTERY, GET_CONTACTS, GET_CHANNEL); the rest are
-   serialized through a FIFO queue and forwarded one at a time to the
-   radio. The radio's reply is routed back to the originating client.
-   `GET_CHANNEL` past the radio's `max_channels` is never forwarded: the
-   firmware's `getChannel` refuses every such idx, so the locally-known
-   NOT_FOUND answer keeps an app's walk to the end of the channel list
-   off the radio's single in-flight slot.
+   DEVICE_INFO, BATTERY, GET_CHANNEL); the rest are serialized through a
+   FIFO queue and forwarded one at a time to the radio. The radio's reply
+   is routed back to the originating client. `GET_CHANNEL` past the
+   radio's `max_channels` is never forwarded: the firmware's `getChannel`
+   refuses every such idx, so the locally-known NOT_FOUND answer keeps an
+   app's walk to the end of the channel list off the radio's single
+   in-flight slot.
+   Contacts are forwarded, never cached: a client's `GET_CONTACTS` (with
+   its own `since` watermark) goes to the radio every time, so the radio's
+   `lastmod` filter keeps the reply a delta and nothing in the proxy can
+   serve a frozen copy. A `GET_CONTACTS` reply is also the one thing that
+   runs *beyond* the single slot: the firmware streams it one contact per
+   radio loop (minutes on a repeater with hundreds of contacts) while
+   still answering the rest of the interface, and refuses only a second
+   `GET_CONTACTS`. The proxy keeps that reply beside the in-flight request
+   rather than in it, and a client that asks while one is streaming is
+   attached to it — replayed the frames it missed — provided the
+   streaming reply covers what it asked for: a whole-book stream covers
+   any ask, a delta only an ask for the same watermark or older. A client
+   that asked for more is queued for its own dump rather than handed a
+   reply that silently lacks contacts.
    If the radio disconnects, any in-flight or queued client request is
    failed immediately with ERROR. A request the radio answers too late to
    beat `--in-flight-timeout` is failed the same way, and the reply that
@@ -247,17 +263,24 @@ All the flags above have `CORESPLITTER_*` equivalents:
 ### Integration tests
 
 Uses a fake radio (`tools/fake_radio.py`) and a real proxy deployed on
-ephemeral ports. Requires Python 3.12+ with `uv`.
+ephemeral ports. Requires Python 3.12+ with `uv`; the first run installs
+pytest and pytest-asyncio from `pyproject.toml`.
 
 ```bash
-uv run tools/test_proxy.py
+uv run pytest tools/test_proxy.py                 # whole suite
+uv run pytest tools/test_proxy.py -k delta        # one test by keyword
+uv run pytest tools/test_proxy.py -x              # stop at the first failure
 ```
 
-All tests run sequentially against one proxy on ephemeral ports, which is
-restarted once by the history tests (same data directory, to prove the
-replayed cursor survives it).
+The suite is one asyncio session: all tests share a single fake radio and
+proxy on ephemeral ports, started once by a session-scoped fixture. Tests
+therefore run in file order and share the radio's state (a channel created in
+test 2 is still there in test 20), and the history tests restart the proxy
+against the same data directory to prove the replayed cursor survives it.
+Selecting a single test with `-k` still starts the full environment, so a
+targeted run behaves like a fresh deployment.
 
-### Current tests (26 cases, 57 assertions, all PASS)
+### Current tests (30)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -286,7 +309,11 @@ replayed cursor survives it).
 | 23 | Client idle timeout | A silent client is reaped while a polling one on the same proxy outlives the sweep |
 | 24 | Out-of-range GET_CHANNEL | Only `idx >= max_channels` is answered locally with NOT_FOUND; idx 39 still reaches the cache and nothing in the test touches the radio |
 | 25 | CLI invalidation | CMD_RUN_CLI_COMMAND (0x42) clears the cached SELF_INFO/DEVICE_INFO, since the CLI is a second setter path |
-| 26 | Client request jumps the sync queue | With the radio slowed to 400 ms per command, a client's non-cacheable request is answered immediately instead of waiting for the proxy's own contacts/channel sync to drain |
+| 26 | Client request jumps the sync queue | With the radio slowed to 400 ms per command, a client's non-cacheable request is answered immediately instead of waiting for the proxy's own channel sync to drain |
+| 27 | Contacts stream runs beside commands | With the contact reply slowed to 2 s per frame, a normal command is still answered at once, a client asking mid-stream is attached and receives the whole book, and the radio only ever sees one `GET_CONTACTS` |
+| 28 | Contacts are client-driven | The proxy never prefetches or stores contacts; a client's `since` reaches the radio unchanged and a repeat request still goes to the radio |
+| 29 | Delta does not cover a full ask | A client asking for the whole book is not attached to someone else's empty delta; it is queued and gets its own full dump |
+| 30 | Factory reset invalidates cache | FACTORY_RESET (0x33) clears the cached DEVICE_INFO and BATTERY instead of serving them stale |
 
 ### Fake radio
 
@@ -303,9 +330,10 @@ uv run tools/fake_radio.py --serial
 
 `--control-port` exposes a newline-delimited control channel so tests can
 drive the radio deterministically instead of racing the periodic
-injector (`delay <ms>`, `hold <hexcode>`, `release`, `push <hex>`,
-`queue <hex>`, `appver`, `stats`). The suite uses it to pin a request
-in-flight while it fires unsolicited pushes, and to assert the
+injector (`delay <ms>`, `hold <hexcode>`, `release`, `stream <ms>`,
+`contacts reset`, `push <hex>`, `queue <hex>`, `appver`, `stats`). The suite
+uses it to pin a request in-flight while it fires unsolicited pushes, to slow a
+contacts reply so a second client's attach can be observed, and to assert the
 negotiated protocol version.
 
 ## Container
@@ -322,4 +350,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 57/57 PASS (26 cases) on TCP backend against fake radio
+- **Tests**: 30 integration tests (pytest) on TCP backend against fake radio, 9 Rust unit tests

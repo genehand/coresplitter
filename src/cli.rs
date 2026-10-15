@@ -71,6 +71,11 @@ pub struct Cli {
     /// round trip: a radio services the companion interface only between its
     /// radio tasks, so a slow preset or a busy repeater can hold a reply back
     /// for seconds after the command itself has already run.
+    ///
+    /// A streaming reply is measured between its frames instead, because a
+    /// `GET_CONTACTS` reply is one frame per radio loop and legitimately runs
+    /// for minutes on a repeater with hundreds of contacts -- see
+    /// `check_contacts_timeout`.
     #[arg(long, default_value_t = 15, env = "CORESPLITTER_IN_FLIGHT_TIMEOUT")]
     pub in_flight_timeout: u64,
 

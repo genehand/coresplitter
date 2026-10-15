@@ -11,7 +11,7 @@ use crate::backend;
 use crate::frontend::tcp::{
     ClientCommand, ClientDirectMap, ClientId, ListenerProfile, TcpFrontend,
 };
-use crate::node::state::{CachedChannel, CachedContact, NewMessage, NodeState};
+use crate::node::state::{CachedChannel, NewMessage, NodeState};
 use crate::protocol::decode::{
     DecodedValue, decode_command_payload, decode_response_payload, format_decoded,
 };
@@ -63,10 +63,11 @@ const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 /// Response codes that are spontaneous pushes from the radio and never complete
 /// an in-flight request. They are always broadcast to every client.
 ///
-/// Because `Awaiting::Any` completes on *any* code not listed here, this list is
-/// load-bearing: a missing unsolicited code gets delivered to whichever client
-/// happens to have a request in flight and terminates it early, robbing every
-/// other client of the frame.
+/// Because `try_route_to_in_flight` completes the in-flight request on any code
+/// that is neither listed here nor a contacts-stream frame (`is_request_reply`),
+/// this list is load-bearing: a missing unsolicited code gets delivered to
+/// whichever client happens to have a request in flight and terminates it
+/// early, robbing every other client of the frame.
 ///
 /// Only list codes the radio emits *without* a corresponding command. The
 /// borderline cases, checked against MeshCore 1.18.0 `MyMesh.cpp`:
@@ -114,20 +115,44 @@ fn is_push_event(code: u8) -> bool {
     PUSH_EVENT_CODES.contains(&code)
 }
 
-/// What a request is waiting for, to know when to free the slot.
-#[derive(Debug, Clone)]
-enum Awaiting {
-    /// Any single non-push response frame completes the request. This is
-    /// the default for most commands: the radio replies with exactly one
-    /// frame per command (OK / ERROR / DEVICE_INFO / CHANNEL_INFO / ...).
-    Any,
-    /// A multi-frame stream: any frame whose code is in `frame_codes`
-    /// belongs to the response; the request completes with `terminator_code`.
-    Stream {
-        frame_codes: Vec<u8>,
-        terminator_code: u8,
-    },
+/// Response codes that only ever belong to a `GET_CONTACTS` reply in progress.
+///
+/// The radio streams that reply one frame per main-loop iteration, so it spans
+/// minutes on a repeater with hundreds of contacts and its frames arrive
+/// interleaved with -- and after -- the replies to commands sent while it ran
+/// (`MyMesh::checkSerialInterface` advances the iterator only on an iteration
+/// where no command arrived; only a second `GET_CONTACTS` is refused, with
+/// ERR_CODE_BAD_STATE). They must therefore never satisfy a *different*
+/// request: a stray CONTACT frame would be eaten by whatever is waiting and its
+/// real answer would then be broadcast to clients that never asked. Same shape
+/// as a missing `PUSH_EVENT_CODES` entry, from the other direction.
+fn is_contacts_frame(code: u8) -> bool {
+    matches!(code, 0x02..=0x04)
 }
+
+/// The `since` a GET_CONTACTS payload carries; absent or zero means the whole
+/// book. A request with a `since` streams only what changed after it, so its
+/// reply cannot be used to conclude the cached rows are complete.
+fn contacts_since(payload: &[u8]) -> u32 {
+    if payload.len() < 5 {
+        return 0;
+    }
+    u32::from_le_bytes(payload[1..5].try_into().unwrap_or([0; 4]))
+}
+
+/// Whether a frame from the radio can complete the request in flight, or be the
+/// reply a ghost is waiting to swallow. Push events never can, and neither can
+/// the frames of an open contacts stream.
+fn is_request_reply(code: u8) -> bool {
+    !is_push_event(code) && !is_contacts_frame(code)
+}
+
+/// How much of an open contacts reply is buffered so a client attaching
+/// mid-stream can be caught up. A companion radio's whole book is
+/// `MAX_CONTACTS` entries of ~150 B (`DEVICE_INFO` reports 350 on the boards
+/// seen so far), so this is headroom over any real reply and only a radio
+/// streaming nonsense can reach it.
+const MAX_CONTACTS_REPLAY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 struct InFlight {
@@ -135,7 +160,6 @@ struct InFlight {
     client_id: Option<ClientId>,
     cmd_code: u8,
     sent_at: Instant,
-    awaiting: Awaiting,
 }
 
 #[derive(Debug)]
@@ -145,64 +169,59 @@ struct Queued {
     payload: Vec<u8>,
 }
 
+/// A `GET_CONTACTS` reply the radio is streaming, if one is open.
+///
+/// This runs *alongside* `in_flight`: the firmware advances the contact
+/// iterator between companion commands rather than blocking on it, so a
+/// client's GET_CHANNEL or GET_MSG is answered while the stream is still
+/// going. At most one may be open -- the radio refuses a second one with
+/// ERR_CODE_BAD_STATE -- so a client that asks while one runs is attached to
+/// it (see `attach_to_contacts`) instead of being forwarded.
+#[derive(Debug)]
+struct ContactsStream {
+    /// Every frame since CONTACT_START, in order. A client that attaches
+    /// mid-stream is replayed this prefix so it receives the whole reply rather
+    /// than the tail of the one already in progress.
+    frames: Vec<Vec<u8>>,
+    /// Clients receiving this reply: the one that asked, plus anyone attached.
+    subscribers: Vec<ClientId>,
+    /// False once `frames` passes the cap; a later subscriber can then no
+    /// longer be caught up and is queued instead.
+    replayable: bool,
+    /// The `since` this reply was asked for. A client may only attach to a
+    /// reply that covers what it asked for: with `since = 0` (the whole book) it
+    /// covers every ask, and a delta covers an ask for the same watermark or
+    /// older. Attaching a client that asked for everything to someone else's
+    /// delta would hand it a truncated list it could not detect as one.
+    since: u32,
+    last_frame_at: Instant,
+}
+
 /// A command the proxy gave up on, whose reply has not arrived yet.
 ///
 /// The radio answers in order, so an owed reply lands before the reply to any
 /// command sent after it — which is exactly why it must be accounted for: it
-/// would otherwise be matched by `Awaiting::Any` against whatever is in flight
-/// and handed to a client that never asked for it.
+/// would otherwise be matched against whatever is in flight and handed to a
+/// client that never asked for it.
 #[derive(Debug)]
 struct Ghost {
     cmd_code: u8,
-    awaiting: Awaiting,
     since: Instant,
-}
-
-/// Whether a response frame belongs to a request waiting under `awaiting`, and
-/// whether it terminates that request. Pushes never belong to a request, even
-/// with the slot open.
-fn frame_matches(awaiting: &Awaiting, code: u8) -> (bool, bool) {
-    if is_push_event(code) {
-        return (false, false);
-    }
-    match awaiting {
-        Awaiting::Any => (true, true),
-        Awaiting::Stream {
-            frame_codes,
-            terminator_code,
-        } => {
-            let in_stream = frame_codes.contains(&code) || code == *terminator_code;
-            (in_stream, code == *terminator_code)
-        }
-    }
-}
-
-/// Map a client command code to the shape of the radio's reply.
-fn awaiting_for(cmd_code: u8) -> Awaiting {
-    match cmd_code {
-        // GET_CONTACTS → CONTACT_START + N x CONTACT + CONTACT_END
-        0x04 => Awaiting::Stream {
-            frame_codes: vec![0x02, 0x03],
-            terminator_code: 0x04,
-        },
-        // Every other command replies with a single non-push frame.
-        // Routing is decided by "not a push event" rather than by an
-        // explicit allow-list so unusual commands (SHARE_CONTACT,
-        // GET_TELEMETRY, GET_STATS, ...) work without per-command entries.
-        _ => Awaiting::Any,
-    }
 }
 
 /// Whether `try_serve_from_cache` can answer this command without the radio.
 ///
-/// These are exactly the reads `sync_from_radio` is filling, which is what
+/// These are the reads the startup sync warms (`initialize_radio` fetches
+/// SELF_INFO and DEVICE_INFO, `sync_from_radio` the channel list), which is what
 /// makes them worth leaving *behind* the sync in `enqueue_or_dispatch` rather
-/// than jumping it. Keep in sync with the arms of `try_serve_from_cache`.
+/// than jumping it: a queued one is normally answered from the freshly warmed
+/// cache without touching the radio. Keep in sync with the arms of
+/// `try_serve_from_cache` -- `GET_CONTACTS` is forwarded, never cached, so it
+/// jumps the sync like any other client request.
 fn cache_served_command(cmd_code: u8) -> bool {
     matches!(
         cmd_code,
         0x01 // APP_START        → SELF_INFO
-            | 0x04 // GET_CONTACTS
             | 0x14 // GET_BATTERY
             | 0x16 // DEVICE_QUERY    → DEVICE_INFO
             | 0x1F // GET_CHANNEL
@@ -274,6 +293,12 @@ pub struct Core {
     // request is in flight; further client commands wait in pending_queue.
     in_flight: Option<InFlight>,
     pending_queue: VecDeque<Queued>,
+    // The one GET_CONTACTS reply that may be streaming alongside `in_flight`.
+    // Contacts are not cached: the request carries the client's own `since`
+    // watermark and the radio answers it, so the proxy's job here is to keep one
+    // dump from being paid for twice -- and to keep a minutes-long one from
+    // blocking every other command.
+    contacts: Option<ContactsStream>,
     // Commands whose client already got ERROR, but whose reply the radio still
     // owes us: it answers in order, so the reply will arrive before that of any
     // command sent afterwards. Holding them here keeps a late reply from being
@@ -342,6 +367,7 @@ impl Core {
             client_channels: Arc::new(Mutex::new(HashMap::new())),
             in_flight: None,
             pending_queue: VecDeque::new(),
+            contacts: None,
             ghosts: VecDeque::new(),
             pending_acks: HashMap::new(),
             history_sync: HashMap::new(),
@@ -362,7 +388,7 @@ impl Core {
         }
 
         // Queue sync commands so they serialize with any early client requests.
-        self.sync_from_radio();
+        self.sync_from_radio().await;
 
         // Load persisted blobs from kv_store if not already set (radio offline fallback)
         if self.self_info_raw.is_none()
@@ -385,7 +411,6 @@ impl Core {
             tracing::info!("restored BATTERY blob from kv_store");
             self.battery_info_raw = Some(blob);
         }
-
         self.prune_history().await;
 
         // The anonymous listener keeps the historical single-port behaviour and
@@ -554,6 +579,15 @@ impl Core {
         {
             self.send_to_client(&cid, vec![0x01, 0x01]);
         }
+        // A contacts reply in progress died with the link. Drop it rather than
+        // leave it open: the re-sync below queues a fresh GET_CONTACTS, and an
+        // open stream would make that one wait for a CONTACT_END that can
+        // never arrive.
+        if let Some(stream) = self.contacts.take() {
+            for cid in &stream.subscribers {
+                self.send_to_client(cid, vec![0x01, 0x01]);
+            }
+        }
         // Fail all queued client requests; discard internal sync entries.
         while let Some(q) = self.pending_queue.pop_front() {
             if let Some(cid) = q.client_id {
@@ -591,7 +625,7 @@ impl Core {
                     match self.initialize_radio().await {
                         Ok(()) => {
                             tracing::info!("radio re-initialized successfully");
-                            self.sync_from_radio();
+                            self.sync_from_radio().await;
                             return;
                         }
                         Err(e) => {
@@ -718,54 +752,28 @@ impl Core {
         }
     }
 
-    fn sync_from_radio(&mut self) {
-        tracing::info!("queuing contacts and channels sync from physical radio");
+    async fn sync_from_radio(&mut self) {
+        tracing::info!("queuing channel sync from physical radio");
 
-        // Enqueue through the normal serialization path so sync responses
-        // can never interleave with in-flight client requests.
-        // client_id=None: responses are cached but not forwarded to any client.
-        self.pending_queue.push_back(Queued {
-            client_id: None,
-            payload: vec![0x04],
-        });
+        // Contacts are deliberately NOT prefetched here. The request is the
+        // client's to make: it carries its own `since` watermark, and the radio
+        // filters the reply by it (`contact.lastmod > since`), so a client that
+        // has synced before asks for a delta and gets a handful of frames. The
+        // proxy owning a second watermark only to re-ask the same question
+        // would duplicate state both ends already keep -- and asking for the
+        // whole book at startup is what made a repeater with hundreds of
+        // contacts pause for minutes on every restart.
+        //
+        // So `GET_CONTACTS` is forwarded rather than originated (see
+        // `handle_client_command`): a client that has synced before asks for a
+        // delta, and one that has not pays for the whole book once.
         for idx in 0..self.max_channels {
             self.pending_queue.push_back(Queued {
                 client_id: None,
                 payload: vec![0x1F, idx],
             });
         }
-        // Kick off the first entry if the radio is idle.
-        if self.in_flight.is_none() {
-            let _ = self.advance_queue_sync();
-        }
-    }
-
-    /// Synchronous (non-async) queue advance used during sync_from_radio
-    /// before the main loop is running. Pops one entry and sends it directly.
-    fn advance_queue_sync(&mut self) -> Option<()> {
-        while let Some(next) = self.pending_queue.pop_front() {
-            if let Some(cid) = next.client_id
-                && !self.client_is_alive(&cid)
-            {
-                continue;
-            }
-            let cmd_code = next.payload[0];
-            let tx = self.radio_send_tx.as_ref()?;
-            if tx.send(next.payload.clone()).is_err() {
-                if let Some(cid) = next.client_id {
-                    self.send_to_client(&cid, vec![0x01, 0x01]);
-                }
-                return None;
-            }
-            self.in_flight = Some(InFlight {
-                client_id: next.client_id,
-                cmd_code,
-                sent_at: Instant::now(),
-                awaiting: awaiting_for(cmd_code),
-            });
-            return Some(());
-        }
-        None
+        self.advance_queue().await;
     }
 
     async fn send_to_radio(&self, data: &[u8]) -> Result<()> {
@@ -792,11 +800,24 @@ impl Core {
         }
 
         // 2. Cache-only paths: serve from RAM / SQLite, never touch the radio.
-        if self.try_serve_from_cache(cmd_code, &cmd).await {
+        if self
+            .try_serve_from_cache(&cmd.client_id, &cmd.payload)
+            .await
+        {
             return;
         }
 
-        // 3. Anything else goes through the serialized radio queue.
+        // 3. A GET_CONTACTS that the cache cannot answer while the radio is
+        //    already streaming one is attached to that stream. Forwarding it
+        //    would only earn ERR_CODE_BAD_STATE (the firmware allows one
+        //    iterator at a time), and waiting for the next stream would cost
+        //    the client the whole book again.
+        if cmd_code == 0x04 && self.attach_to_contacts(&cmd.client_id, contacts_since(&cmd.payload))
+        {
+            return;
+        }
+
+        // 4. Anything else goes through the serialized radio queue.
         self.enqueue_or_dispatch(Some(cmd.client_id), cmd.payload)
             .await;
     }
@@ -805,37 +826,32 @@ impl Core {
     /// forwarding to the radio. The set of codes handled here is mirrored by
     /// `cache_served_command`, which decides queue precedence; a new arm needs
     /// an entry there too.
-    async fn try_serve_from_cache(&self, cmd_code: u8, cmd: &ClientCommand) -> bool {
+    async fn try_serve_from_cache(&self, client_id: &ClientId, payload: &[u8]) -> bool {
+        let Some(&cmd_code) = payload.first() else {
+            return false;
+        };
         match cmd_code {
             0x01 => {
                 if let Some(ref blob) = self.self_info_raw {
-                    self.send_to_client(&cmd.client_id, blob.clone());
+                    self.send_to_client(client_id, blob.clone());
                     return true;
                 }
             }
             0x16 => {
                 if let Some(ref blob) = self.device_info_raw {
-                    self.send_to_client(&cmd.client_id, blob.clone());
+                    self.send_to_client(client_id, blob.clone());
                     return true;
                 }
             }
             0x14 => {
                 if let Some(ref blob) = self.battery_info_raw {
-                    self.send_to_client(&cmd.client_id, blob.clone());
-                    return true;
-                }
-            }
-            0x04 => {
-                if let Ok(contacts) = self.state.get_contacts().await
-                    && !contacts.is_empty()
-                {
-                    self.respond_contacts(&cmd.client_id, &contacts).await;
+                    self.send_to_client(client_id, blob.clone());
                     return true;
                 }
             }
             0x1F => {
-                let requested_idx = if cmd.payload.len() > 1 {
-                    cmd.payload[1] as i64
+                let requested_idx = if payload.len() > 1 {
+                    payload[1] as i64
                 } else {
                     -1
                 };
@@ -850,13 +866,13 @@ impl Core {
                         max_channels = self.max_channels,
                         "GET_CHANNEL out of range, replying locally"
                     );
-                    self.send_to_client(&cmd.client_id, vec![0x01, 0x02]);
+                    self.send_to_client(client_id, vec![0x01, 0x02]);
                     return true;
                 }
                 if let Ok(channels) = self.state.get_channels().await
                     && let Some(ch) = channels.iter().find(|c| c.idx == requested_idx)
                 {
-                    self.respond_channel_info(&cmd.client_id, ch).await;
+                    self.respond_channel_info(client_id, ch).await;
                     return true;
                 }
             }
@@ -1094,11 +1110,11 @@ impl Core {
     /// otherwise dispatch it immediately.
     ///
     /// A client's request jumps ahead of the entries `sync_from_radio` left in
-    /// the queue. That sync is `1 + max_channels` requests long (contacts, then
-    /// every channel slot) and the radio answers one command per loop, so on a
-    /// slow link it occupies the queue for seconds; a command left behind all of
-    /// it is delayed for every one of them, even though none of it is the work
-    /// the client asked for.
+    /// the queue. That sync is `max_channels` requests long (every channel slot)
+    /// and the radio answers one command per loop, so on a slow link it occupies
+    /// the queue for seconds; a command left behind all of it is delayed for
+    /// every one of them, even though none of it is the work the client asked
+    /// for.
     ///
     /// The reads `try_serve_from_cache` can answer are the exception, and they
     /// keep their place. The sync is filling those very cache entries, so a
@@ -1107,7 +1123,12 @@ impl Core {
     /// radio what the sync is already reading — which is what a client walking
     /// the channel list on connect would then do, doubling the work.
     async fn enqueue_or_dispatch(&mut self, client_id: Option<ClientId>, payload: Vec<u8>) {
-        if self.in_flight.is_none() {
+        // A second GET_CONTACTS must never go out while one is streaming. The
+        // firmware refuses it (ERR_CODE_BAD_STATE), and that ERROR frame would
+        // be ambiguous with the frames still arriving. It waits its turn
+        // instead; `advance_queue` keeps it parked until the stream ends.
+        let behind_contacts_stream = payload[0] == 0x04 && self.contacts.is_some();
+        if self.in_flight.is_none() && !behind_contacts_stream {
             self.dispatch_to_radio(client_id, payload).await;
             return;
         }
@@ -1128,11 +1149,11 @@ impl Core {
         self.pending_queue.push_back(entry);
     }
 
-    /// Forward a command to the radio and set up the in_flight slot.
-    /// On forward failure replies ERROR to the originating client (if any)
-    /// and leaves the slot free. On success performs post-forward side
-    /// effects (echo synthesis for SEND_*, cache invalidation for setters).
-    async fn dispatch_to_radio(&mut self, client_id: Option<ClientId>, payload: Vec<u8>) {
+    /// Forward a command to the radio and set up the slot its reply needs.
+    /// Returns false if the forward failed and ERROR was sent to the
+    /// originating client. On success performs post-forward side effects
+    /// (echo synthesis for SEND_*, cache invalidation for setters).
+    async fn dispatch_to_radio(&mut self, client_id: Option<ClientId>, payload: Vec<u8>) -> bool {
         let cmd_code = payload[0];
 
         if let Err(e) = self.send_to_radio(&payload).await {
@@ -1140,7 +1161,7 @@ impl Core {
             if let Some(cid) = client_id {
                 self.send_to_client(&cid, vec![0x01, 0x01]);
             }
-            return;
+            return false;
         }
 
         if let Some(cid) = client_id {
@@ -1190,18 +1211,41 @@ impl Core {
             _ => {}
         }
 
+        if cmd_code == 0x04 {
+            // The reply is a stream, not one frame: it gets its own slot so it
+            // does not hold the radio hostage for the minutes it can run. The
+            // firmware advances the iterator between commands, so normal
+            // requests keep flowing beside it.
+            debug_assert!(
+                self.contacts.is_none(),
+                "a second GET_CONTACTS reached the radio while one was streaming"
+            );
+            self.contacts = Some(ContactsStream {
+                frames: Vec::new(),
+                subscribers: client_id.into_iter().collect(),
+                replayable: true,
+                since: contacts_since(&payload),
+                last_frame_at: Instant::now(),
+            });
+            return true;
+        }
+
         self.in_flight = Some(InFlight {
             client_id,
             cmd_code,
             sent_at: Instant::now(),
-            awaiting: awaiting_for(cmd_code),
         });
+        true
     }
 
     /// Pop and dispatch the next queued command for which the originating
     /// client is still connected. Internal sync entries (client_id=None)
     /// are always eligible. Stops at the first one successfully dispatched,
     /// or when the queue empties.
+    ///
+    /// An open contacts stream does not block this. It runs beside the
+    /// in-flight slot, and the only thing it holds back is another
+    /// `GET_CONTACTS` (which the radio would refuse anyway).
     async fn advance_queue(&mut self) {
         while let Some(next) = self.pending_queue.pop_front() {
             if let Some(cid) = next.client_id
@@ -1210,11 +1254,32 @@ impl Core {
                 tracing::debug!(client = %cid, "dropping queued request: client gone");
                 continue;
             }
-            self.dispatch_to_radio(next.client_id, next.payload).await;
-            if self.in_flight.is_some() {
+            // A second GET_CONTACTS while one is streaming is refused by the
+            // firmware (ERR_CODE_BAD_STATE), and its reply would be ambiguous
+            // with the frames still arriving. Park the asker instead; it is
+            // served from the completed cache when the stream ends.
+            if next.payload[0] == 0x04 && self.contacts.is_some() {
+                self.pending_queue.push_front(next);
                 return;
             }
-            // dispatch failed; ERROR already sent. Try the next.
+            // The cache may have been filled while this waited (a sync reply
+            // answered in the meantime), in which case the radio does not need
+            // to be touched at all.
+            if let Some(cid) = next.client_id
+                && self.try_serve_from_cache(&cid, &next.payload).await
+            {
+                continue;
+            }
+            if self.in_flight.is_some() {
+                // The one normal slot is taken; this must wait its turn.
+                self.pending_queue.push_front(next);
+                return;
+            }
+            if !self.dispatch_to_radio(next.client_id, next.payload).await {
+                continue; // ERROR already sent; try the next entry
+            }
+            // Keep draining: the contacts stream lives in its own slot and
+            // does not stop the channel sync queued behind it.
         }
     }
 
@@ -1326,10 +1391,19 @@ impl Core {
         }
     }
 
-    /// Called on every timeout tick. If the current in_flight has been
-    /// pending longer than the configured timeout, fail it with ERROR and
-    /// advance the queue.
+    /// Called on every timeout tick. Fails the request in flight once it has
+    /// gone unanswered for longer than the configured timeout, and an open
+    /// contacts reply once its radio has gone quiet for that long.
+    ///
+    /// They are measured differently because they are shaped differently: the
+    /// in-flight request is a single frame, so its age is the only signal,
+    /// while a streamed reply is judged by the gap between its frames -- one
+    /// frame per radio loop legitimately takes minutes on a repeater with
+    /// hundreds of contacts, and a radio that has genuinely stalled says
+    /// nothing at all.
     async fn check_in_flight_timeout(&mut self) {
+        self.check_contacts_timeout().await;
+
         let timed_out = self
             .in_flight
             .as_ref()
@@ -1358,6 +1432,34 @@ impl Core {
         self.advance_queue().await;
     }
 
+    /// Fail an open contacts reply whose radio has gone quiet.
+    ///
+    /// The stream is dropped rather than ghosted: its frames are excluded from
+    /// every request's matching (see `is_contacts_frame`), so whatever the
+    /// radio still owes arrives as an unclaimed broadcast instead of being
+    /// eaten by the next client's request. What must not happen is a second
+    /// `GET_CONTACTS` while the radio thinks its iterator is still running, so
+    /// the next one waits for `contacts` to clear, which this does.
+    async fn check_contacts_timeout(&mut self) {
+        let stalled = self
+            .contacts
+            .as_ref()
+            .is_some_and(|s| s.last_frame_at.elapsed() >= self.config.in_flight_timeout);
+        if !stalled {
+            return;
+        }
+        let stream = self.contacts.take().expect("checked Some above");
+        tracing::warn!(
+            frames = stream.frames.len(),
+            idle_ms = stream.last_frame_at.elapsed().as_millis() as u64,
+            "contacts stream stalled, abandoning it"
+        );
+        for cid in &stream.subscribers {
+            self.send_to_client(cid, vec![0x01, 0x01]);
+        }
+        self.advance_queue().await;
+    }
+
     /// Keep track of the reply the radio still owes a command we just failed.
     fn remember_ghost(&mut self, f: InFlight) {
         if self.ghosts.len() >= MAX_GHOSTS {
@@ -1369,7 +1471,6 @@ impl Core {
         }
         self.ghosts.push_back(Ghost {
             cmd_code: f.cmd_code,
-            awaiting: f.awaiting,
             since: Instant::now(),
         });
     }
@@ -1380,25 +1481,21 @@ impl Core {
     /// still owes exactly one reply for that command and answers in order — so
     /// the next frame to arrive is that reply, not the answer to whatever
     /// request is in flight now. Offering it to the live request would hand one
-    /// client another client's answer (`Awaiting::Any` accepts any non-push
-    /// code) and then broadcast the displaced reply to everybody. The owed reply
-    /// is dropped instead, loudly, and the live request keeps waiting for its
-    /// own.
+    /// client another client's answer (`is_request_reply` accepts any non-push,
+    /// non-contacts code) and then broadcast the displaced reply to everybody.
+    /// The owed reply is dropped instead, loudly, and the live request keeps
+    /// waiting for its own.
     ///
     /// Returns true when the frame was accounted for and must not be routed.
     fn try_claim_ghost(&mut self, code: u8, payload: &[u8], logged: Option<i64>) -> bool {
-        let Some(ghost) = self.ghosts.front() else {
+        if !is_request_reply(code) {
+            return false;
+        }
+        let Some(ghost) = self.ghosts.pop_front() else {
             return false;
         };
-        let (matched, terminator) = frame_matches(&ghost.awaiting, code);
-        if !matched {
-            return false;
-        }
         let cmd_code = ghost.cmd_code;
         let late_ms = ghost.since.elapsed().as_millis() as u64;
-        if terminator {
-            self.ghosts.pop_front();
-        }
         tracing::warn!(
             cmd = format_args!("0x{cmd_code:02x}"),
             reply = format_args!("0x{code:02x}"),
@@ -1470,46 +1567,6 @@ impl Core {
         }
     }
 
-    async fn respond_contacts(&self, client_id: &ClientId, contacts: &[CachedContact]) {
-        let count = contacts.len() as u32;
-        let now = chrono::Utc::now().timestamp() as u32;
-
-        let mut start = vec![0x02];
-        start.extend_from_slice(&u32::to_le_bytes(count));
-        self.send_to_client(client_id, start);
-
-        for contact in contacts {
-            let mut c = vec![0x03];
-            let mut pk_b = [0u8; 32];
-            let pklen = contact.public_key.len().min(32);
-            pk_b[..pklen].copy_from_slice(&contact.public_key[..pklen]);
-            c.extend_from_slice(&pk_b);
-            c.push(contact.contact_type as u8);
-            c.push(0); // flags
-            c.push(0); // path_len
-            c.extend_from_slice(&[0u8; 64]); // path
-            let mut name_b = [0u8; 32];
-            let nlen = contact.name.len().min(32);
-            name_b[..nlen].copy_from_slice(&contact.name.as_bytes()[..nlen]);
-            c.extend_from_slice(&name_b);
-            let last_advert = contact.last_advert.unwrap_or(now as i64) as u32;
-            c.extend_from_slice(&u32::to_le_bytes(last_advert));
-            let lat_i = (contact.lat.unwrap_or(0.0) * 1_000_000.0) as i32;
-            let lon_i = (contact.lon.unwrap_or(0.0) * 1_000_000.0) as i32;
-            c.extend_from_slice(&i32::to_le_bytes(lat_i));
-            c.extend_from_slice(&i32::to_le_bytes(lon_i));
-            c.extend_from_slice(&[0u8; 4]); // last_mod
-
-            self.send_to_client(client_id, c);
-        }
-
-        let mut end = vec![0x04];
-        end.extend_from_slice(&u32::to_le_bytes(now));
-        self.send_to_client(client_id, end);
-
-        tracing::debug!(n = count, "responded with cached contacts");
-    }
-
     async fn respond_channel_info(&self, client_id: &ClientId, channel: &CachedChannel) {
         tracing::info!(idx = channel.idx, name = %channel.name, "responding with cached CHANNEL_INFO");
         let mut payload = vec![0x12];
@@ -1541,24 +1598,29 @@ impl Core {
             let _ = self.state.insert_raw_rx(resp_code, &payload).await;
         }
 
-        // 1. A reply the radio still owed a request the proxy already failed
+        // 1. A frame of the contacts reply that is streaming beside the slot
+        //    belongs to that stream, never to the request in flight.
+        if self.try_route_contacts_stream(resp_code, &payload).await {
+            return;
+        }
+        // 2. A reply the radio still owed a request the proxy already failed
         //    must not be offered to the live in-flight request below.
         if self.try_claim_ghost(resp_code, &payload, logged) {
             return;
         }
-        // 2. If the frame completes (or belongs to) the in_flight request,
-        //    route it to that client.
+        // 3. If the frame completes the in_flight request, route it to that
+        //    client.
         if self
             .try_route_to_in_flight(resp_code, &payload, logged)
             .await
         {
             return;
         }
-        // 3. If it's a late ACK matching a previous MSG_SENT, route it.
+        // 4. If it's a late ACK matching a previous MSG_SENT, route it.
         if self.try_route_ack(resp_code, &payload) {
             return;
         }
-        // 4. Otherwise it's a spontaneous push event from the radio
+        // 5. Otherwise it's a spontaneous push event from the radio
         //    (MESSAGES_WAITING, ADVERTISEMENT, NEW_ADVERT, ...), which
         //    everybody received.
         let _ = self.broadcast_tx.send(payload);
@@ -1568,9 +1630,8 @@ impl Core {
     }
 
     /// Match the response against the current in_flight request. Returns
-    /// true if it was routed (whether or not it terminated the request).
-    /// `logged` is the row id `cache_response` just assigned, when the frame
-    /// carried a message at all.
+    /// true if it was routed. `logged` is the row id `cache_response` just
+    /// assigned, when the frame carried a message at all.
     async fn try_route_to_in_flight(
         &mut self,
         code: u8,
@@ -1581,10 +1642,9 @@ impl Core {
             return false;
         };
 
-        // Push events never complete a request, even if a slot is open.
-        let (matched, is_terminator) = frame_matches(&in_flight.awaiting, code);
-
-        if !matched {
+        // Push events never complete a request, even with a slot open, and
+        // neither does a frame of the contacts stream running beside it.
+        if !is_request_reply(code) {
             return false;
         }
 
@@ -1643,9 +1703,100 @@ impl Core {
             }
         }
 
-        if is_terminator {
-            self.in_flight = None;
-            self.advance_queue().await;
+        // Every request that reaches this point is a single-frame one; the
+        // only multi-frame reply (GET_CONTACTS) is tracked as a stream, not as
+        // the in-flight request. So the reply frees the slot.
+        self.in_flight = None;
+        self.advance_queue().await;
+        true
+    }
+
+    /// Route a frame of the contacts reply currently streaming, if one is open.
+    ///
+    /// These frames arrive interleaved with other commands' replies, so they
+    /// are claimed here before anything else can look at them. They are also
+    /// excluded from the request matcher (`is_contacts_frame`), which is what
+    /// keeps the frames of a stream the proxy has given up on from being eaten
+    /// by the next client's request.
+    async fn try_route_contacts_stream(&mut self, code: u8, payload: &[u8]) -> bool {
+        if !is_contacts_frame(code) || self.contacts.is_none() {
+            return false;
+        }
+
+        let end = code == 0x04;
+        let subscribers = {
+            let stream = self.contacts.as_mut().expect("checked Some above");
+            stream.last_frame_at = Instant::now();
+            if !end && stream.replayable {
+                let buffered: usize = stream.frames.iter().map(Vec::len).sum();
+                if buffered + payload.len() > MAX_CONTACTS_REPLAY_BYTES {
+                    // Past the cap a late subscriber can no longer be caught up,
+                    // and half a catch-up is worse than none: stop keeping
+                    // frames and let later asks wait for the cached list.
+                    stream.replayable = false;
+                    stream.frames = Vec::new();
+                    tracing::warn!(
+                        limit = MAX_CONTACTS_REPLAY_BYTES,
+                        "contacts reply too large to replay to a late subscriber"
+                    );
+                } else {
+                    stream.frames.push(payload.to_vec());
+                }
+            }
+            stream.subscribers.clone()
+        };
+
+        for cid in &subscribers {
+            self.send_to_client(cid, payload.to_vec());
+        }
+
+        if !end {
+            return true;
+        }
+
+        // CONTACT_END: this reply is finished. Whether it covered the whole
+        // book or a `since` delta is the client's business, not ours -- nothing
+        // is stored, so there is no completeness to record.
+        let stream = self.contacts.take().expect("checked Some above");
+        tracing::info!(
+            frames = stream.frames.len(),
+            subscribers = subscribers.len(),
+            since = stream.since,
+            "contacts reply complete"
+        );
+        // A request parked while this reply was open can go to the radio now.
+        self.advance_queue().await;
+        true
+    }
+
+    /// Attach a client to the contacts reply already streaming, replaying the
+    /// frames it missed. Returns false when nothing is streaming, the reply
+    /// grew past the replay cap, or the reply does not cover what this client
+    /// asked for -- in which case the caller queues the request instead.
+    fn attach_to_contacts(&mut self, client_id: &ClientId, client_since: u32) -> bool {
+        let (frames, replayable, already_attached, covers) = match self.contacts.as_ref() {
+            Some(stream) => (
+                stream.frames.clone(),
+                stream.replayable,
+                stream.subscribers.contains(client_id),
+                // A full book (`since == 0`) covers any ask, so the test
+                // collapses to a straight watermark comparison.
+                stream.since <= client_since,
+            ),
+            None => return false,
+        };
+        if !replayable || already_attached || !covers {
+            return false;
+        }
+        if let Some(stream) = self.contacts.as_mut() {
+            stream.subscribers.push(*client_id);
+        }
+        tracing::info!(
+            frames = frames.len(),
+            "attaching a client to the contacts reply already in progress"
+        );
+        for frame in frames {
+            self.send_to_client(client_id, frame);
         }
         true
     }
@@ -1668,37 +1819,8 @@ impl Core {
         let recv_ts = chrono::Utc::now().timestamp();
         let mut logged = None;
         match code {
-            0x03 if payload.len() >= 148 => {
-                let pk = payload[1..33].to_vec();
-                let contact_type = payload[33] as i64;
-                let name = String::from_utf8_lossy(
-                    &payload[100..][..payload[100..].iter().position(|&b| b == 0).unwrap_or(32)],
-                )
-                .to_string();
-                let last_advert =
-                    u32::from_le_bytes(payload[132..136].try_into().unwrap_or([0; 4])) as i64;
-                let lat = f64::from(i32::from_le_bytes(
-                    payload[136..140].try_into().unwrap_or([0; 4]),
-                )) / 1_000_000.0;
-                let lon = f64::from(i32::from_le_bytes(
-                    payload[140..144].try_into().unwrap_or([0; 4]),
-                )) / 1_000_000.0;
-
-                if let Err(e) = self
-                    .state
-                    .upsert_contact(&CachedContact {
-                        public_key: pk,
-                        name,
-                        contact_type,
-                        last_advert: Some(last_advert),
-                        lat: if lat != 0.0 { Some(lat) } else { None },
-                        lon: if lon != 0.0 { Some(lon) } else { None },
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, "failed to cache contact");
-                }
-            }
+            // RESP_CODE_CONTACT (0x03) and RESP_CODE_ADVERT_PATH etc. are not
+            // cached: contacts are multiplexed, not stored (see `Core::contacts`).
             0x05 => {
                 let blob = payload.to_vec();
                 let _ = self.state.kv_set("self_info_raw", &blob).await;

@@ -10,6 +10,9 @@ import subprocess
 import sys
 import time
 
+import pytest
+import pytest_asyncio
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 logging.basicConfig(
@@ -79,22 +82,6 @@ class Client:
             if len(p) and p[0] == 0x00:
                 return p
         return None
-
-    async def get_contacts(self, lastmod=0):
-        await self.send(b"\x04" + struct.pack("<I", lastmod))
-        contacts = []
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < 5:
-            p = await self.recv(1)
-            if p is None:
-                break
-            if len(p) == 0:
-                continue
-            if p[0] == 0x03:
-                contacts.append(p)
-            elif p[0] == 0x04:
-                break
-        return contacts
 
     async def get_message(self):
         await self.send(b"\x0A")
@@ -187,6 +174,14 @@ class Control:
     async def stats(self) -> dict:
         return json.loads(await self.cmd("stats"))
 
+    async def stream_delay(self, ms: int) -> str:
+        """Gap between two frames of a CONTACT reply (0 = as fast as possible)."""
+        return await self.cmd(f"stream {ms}")
+
+    async def contacts_reset(self) -> str:
+        """Restore the fake radio's built-in contact list."""
+        return await self.cmd("contacts reset")
+
     async def close(self):
         self.w.close()
 
@@ -256,18 +251,14 @@ def is_channel_frame(p: bytes) -> bool:
 
 # --- Test cases ---
 
-PASS = 0
-FAIL = 0
-
 def ok(msg):
-    global PASS
-    PASS += 1
     log.info("  PASS: %s", msg)
 
+
 def fail(msg):
-    global FAIL
-    FAIL += 1
+    """Record a failed assertion. Raising is what fails the pytest test."""
     log.error("  FAIL: %s", msg)
+    raise AssertionError(msg)
 
 
 async def test_multi_client(proxy_port):
@@ -590,7 +581,7 @@ async def test_send_contact_msg(proxy_port):
 
 
 async def test_reconnect_tcp(proxy_port):
-    global fake_proc, fake_pid, fake_port
+    global _fake_proc, _fake_pid, _fake_port
     log.info("--- Test 10: TCP disconnection + reconnection ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
@@ -600,22 +591,22 @@ async def test_reconnect_tcp(proxy_port):
         return
 
     # Kill fake radio
-    if fake_proc and fake_proc.returncode is None:
-        log.info("  Killing fake radio (PID=%d)...", fake_pid)
-        fake_proc.terminate()
+    if _fake_proc and _fake_proc.returncode is None:
+        log.info("  Killing fake radio (PID=%d)...", _fake_pid)
+        _fake_proc.terminate()
         try:
-            await asyncio.wait_for(fake_proc.wait(), timeout=5)
+            await asyncio.wait_for(_fake_proc.wait(), timeout=5)
         except asyncio.TimeoutError:
-            fake_proc.kill()
-    fake_proc = None
+            _fake_proc.kill()
+    _fake_proc = None
 
     await asyncio.sleep(4)
     log.info("  Proxy should be reconnecting...")
 
     # Restart fake radio on the same port (proxy still tries to reconnect to old port)
     log.info("  Restarting fake radio...")
-    await start_fake(port=fake_port)
-    if not fake_proc:
+    await start_fake(port=_fake_port)
+    if not _fake_proc:
         fail("could not restart fake radio")
         await c.close()
         return
@@ -1468,9 +1459,9 @@ async def test_client_idle_timeout():
     data_dir = f"/tmp/cs_test_proxy/{os.getpid()}/idle"
     subprocess.run(["rm", "-rf", data_dir], check=False)
     proc = await asyncio.create_subprocess_exec(
-        proxy_args[0],
+        _proxy_args[0],
         "--tcp-backend-host", "127.0.0.1",
-        "--tcp-backend-port", str(fake_port),
+        "--tcp-backend-port", str(_fake_port),
         "--tcp-frontend-port", str(port),
         "--data-dir", data_dir,
         "--log-level", "info",
@@ -1590,7 +1581,7 @@ async def test_client_request_jumps_sync_queue(proxy_port, control_port):
     """
     log.info("--- Test 26: client requests jump the internal sync queue ---")
     ctl = await connect_control(control_port)
-    # 400 ms per command: the contacts + channel sync alone is then >16 s, far
+    # 400 ms per command: the channel sync alone is then >16 s, far
     # past the 3 s window this test gives the client's reply.
     await ctl.delay(400)
 
@@ -1631,51 +1622,459 @@ async def test_client_request_jumps_sync_queue(proxy_port, control_port):
         ok(f"client request answered in {elapsed:.2f}s, ahead of the sync queue")
 
 
-# --- Harness ---
+def contact_name(frame: bytes) -> str:
+    """The name field of a RESP_CODE_CONTACT frame, [100..132]."""
+    return frame[100:132].split(b"\x00")[0].decode("utf-8", "replace")
 
-fake_proc = None
-fake_pid = None
-fake_port = None
-control_port = None
-proxy_port = None
-proxy_proc = None
-proxy_args = None
 
-async def start_fake(port=None):
-    global fake_proc, fake_pid, fake_port, control_port
-    if port is None:
-        fake_port = await find_free_port()
-    else:
-        fake_port = port
-    control_port = await find_free_port()
-    fake_proc = await asyncio.create_subprocess_exec(
-        sys.executable, os.path.join(os.path.dirname(__file__), "fake_radio.py"),
-        "--port", str(fake_port), "--inject",
-        "--control-port", str(control_port),
+async def read_contacts_reply(client, timeout=8.0):
+    """Collect one CONTACT reply; returns (declared total, frames received).
+
+    The total in CONTACT_START is the radio's whole table, not the number of
+    frames this reply carries: a `since` request announces the total and then
+    sends only what changed, which is what the client's own watermark relies on.
+    """
+    frames = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        p = await client.recv(1.0)
+        if p is None:
+            break
+        if len(p) and p[0] in (0x02, 0x03, 0x04):
+            frames.append(p)
+            if p[0] == 0x04:
+                break
+    declared = (
+        int.from_bytes(frames[0][1:5], "little") if frames and len(frames[0]) >= 5 else -1
+    )
+    return declared, frames
+
+
+async def spawn_scratch_proxy(tag, timeout="6"):
+    """A proxy on its own port and its own (fresh) data directory.
+
+    Needed wherever cache state is the thing under test: the suite's shared
+    proxy has been warming its own caches for twenty tests by then.
+    """
+    port = await find_free_port()
+    data_dir = f"/tmp/cs_test_proxy/{os.getpid()}/{tag}"
+    subprocess.run(["rm", "-rf", data_dir], check=False)
+    proc = await asyncio.create_subprocess_exec(
+        _proxy_args[0],
+        "--tcp-backend-host", "127.0.0.1",
+        "--tcp-backend-port", str(_fake_port),
+        "--tcp-frontend-port", str(port),
+        "--data-dir", data_dir,
+        "--log-level", "info",
+        "--in-flight-timeout", timeout,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    fake_pid = fake_proc.pid
-    log.info("Fake radio started (PID=%d, port=%d, control=%d)", fake_pid, fake_port, control_port)
-    ok = await wait_for_port(fake_port)
-    if not ok:
-        log.error("Fake radio no responde")
+    if not await wait_for_port(port):
+        return None, port
+    return proc, port
+
+
+async def stop_proc(proc):
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+async def test_contacts_stream_runs_beside_requests(control_port):
+    """Test 27: a client's contacts dump streams beside everything else.
+
+    The dump is the client's own request -- the proxy neither prefetches nor
+    stores contacts -- and the radio keeps serving the rest of the interface
+    while it runs. A second client that asks while it is in flight is attached
+    to it, replayed the frames it missed, rather than paying for a second dump.
+    """
+    log.info("--- Test 27: contacts dump streams beside other commands ---")
+    ctl = await connect_control(control_port)
+    base = (await ctl.stats()).get("cmd_counts", {})
+    # 2000 ms per frame puts CONTACT_END ~6 s out.
+    await ctl.stream_delay(2000)
+
+    proc, port = await spawn_scratch_proxy("contacts_stream")
+    a = b = c = None
+    try:
+        if proc is None:
+            fail("contacts-stream proxy did not start")
+            return
+
+        a = await connect_client(port=port)
+        await a.send(bytes([0x04]))  # bare GET_CONTACTS == since 0 == whole book
+
+        if not await _wait_for_iter_started(ctl, 5.0):
+            fail("the radio never started streaming the contacts reply")
+            return
+
+        # 1. A normal command is answered while the dump runs. A separate client
+        #    asks, because a reader that has to skip non-contact frames would
+        #    eat them out of the dump it is also collecting.
+        c = await connect_client(port=port)
+        t0 = time.monotonic()
+        await c.send(bytes([0x05]))  # CMD_GET_DEVICE_TIME
+        answered = None
+        while time.monotonic() - t0 < 1.5:
+            p = await c.recv(0.5)
+            if p and p[0] == 0x09:
+                answered = time.monotonic() - t0
+                break
+        if answered is None:
+            fail("no answer to a normal command while the contacts reply streamed")
+        elif answered > 1.0:
+            fail(f"normal command took {answered:.2f}s behind the contacts stream")
+        else:
+            ok(f"normal command answered in {answered:.2f}s during the contacts stream")
+
+        # 2. A second client's GET_CONTACTS attaches to the dump in flight.
+        b = await connect_client(port=port)
+        await b.send(bytes([0x04]))
+
+        # Read the originating client's reply first: the dump runs ~6 s and the
+        # others' frames buffer in their sockets meanwhile.
+        declared_a, frames_a = await read_contacts_reply(a)
+        names_a = [contact_name(f) for f in frames_a if f[0] == 0x03]
+        if frames_a and frames_a[-1][0] == 0x04 and declared_a == len(names_a):
+            ok(f"the originating client received its whole reply ({names_a})")
+        else:
+            fail(f"originating client's reply was cut short: {[hex(f[0]) for f in frames_a]}")
+
+        declared_b, frames_b = await read_contacts_reply(b)
+        names_b = [contact_name(f) for f in frames_b if f[0] == 0x03]
+        if not frames_b or frames_b[-1][0] != 0x04:
+            fail(f"attached client did not get a complete reply: {[hex(f[0]) for f in frames_b]}")
+        elif names_b != names_a:
+            fail(f"attached client got {names_b}, the dump carried {names_a}")
+        else:
+            ok(f"a client attaching mid-dump received the same reply ({names_b})")
+
+        streams = (await ctl.stats()).get("cmd_counts", {}).get("0x04", 0) - base.get("0x04", 0)
+        if streams == 1:
+            ok("the radio was asked for contacts once: the second client attached")
+        else:
+            fail(f"the radio saw {streams} GET_CONTACTS, expected 1")
+    finally:
+        for client in (a, b, c):
+            if client is not None:
+                await client.close()
+        await ctl.stream_delay(0)
+        await stop_proc(proc)
+        await ctl.close()
+
+
+
+async def _wait_for_iter_started(ctl, timeout):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if (await ctl.stats()).get("iter_started"):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def test_contacts_are_client_driven(control_port):
+    """Test 28: the proxy neither asks for contacts nor stores them.
+
+    A proxy-side watermark would be a third copy of state: the radio filters on
+    `contact.lastmod` and the client keeps its own watermark from
+    CONTACT_END. A contacts *cache* is worse still -- once it can answer
+    `GET_CONTACTS` itself, no client request reaches the radio, so no delta ever
+    arrives to refresh it, and it freezes at whatever full dump it was built
+    from. So contacts are multiplexed, not cached: the client's request (with
+    its `since`) goes to the radio every time, and only a reply already in
+    flight is shared.
+    """
+    log.info("--- Test 28: contacts are the client's request, not the proxy's ---")
+    ctl = await connect_control(control_port)
+    base = (await ctl.stats()).get("cmd_counts", {})
+    max_lastmod = (await ctl.stats()).get("contacts_lastmod_max", 0)
+
+    proc, port = await spawn_scratch_proxy("contacts_client_driven")
+    try:
+        if proc is None:
+            fail("contacts proxy did not start")
+            return
+        # The channel sync is the proxy's own; contacts must not be touched.
+        await asyncio.sleep(1.0)
+        streams = (await ctl.stats()).get("cmd_counts", {}).get("0x04", 0) - base.get("0x04", 0)
+        if streams == 0:
+            ok("the proxy asked the radio for no contacts at startup")
+        else:
+            fail(f"the proxy sent {streams} GET_CONTACTS at startup; contacts are the client's")
+
+        c = await connect_client(port=port)
+
+        # 1. A client's `since` reaches the radio unchanged.
+        await c.send(b"\x04" + struct.pack("<I", max_lastmod))
+        declared, frames = await read_contacts_reply(c)
+        contacts = sum(1 for f in frames if f[0] == 0x03)
+        seen_since = (await ctl.stats()).get("contacts_since")
+        if seen_since == max_lastmod:
+            ok(f"the client's since ({max_lastmod}) reached the radio unchanged")
+        else:
+            fail(f"the radio saw since={seen_since}, expected the client's {max_lastmod}")
+        # Nothing in the fake radio's list is newer than that, so this is an
+        # empty delta -- which still announces the whole table, as the protocol
+        # requires (the count is the table, not the reply).
+        if declared > 0 and contacts == 0 and frames and frames[-1][0] == 0x04:
+            ok(f"the delta announced all {declared} contacts and sent none")
+        else:
+            fail(f"unexpected delta reply: declared={declared} contact_frames={contacts}")
+
+        # 2. Nothing was stored: a full book and then a delta each go to the
+        #    radio again, instead of being answered from a copy.
+        before = (await ctl.stats()).get("cmd_counts", {}).get("0x04", 0)
+        await c.send(b"\x04")
+        declared, frames = await read_contacts_reply(c)
+        full = sum(1 for f in frames if f[0] == 0x03)
+        if full > 0 and declared == full:
+            ok(f"a full request streamed {full} contacts")
+        else:
+            fail(f"unexpected full reply: declared={declared} contact_frames={full}")
+
+        await c.send(b"\x04" + struct.pack("<I", max_lastmod))
+        _declared, frames = await read_contacts_reply(c)
+        again = sum(1 for f in frames if f[0] == 0x03)
+        after = (await ctl.stats()).get("cmd_counts", {}).get("0x04", 0)
+        if after - before == 2:
+            ok("every request reached the radio: nothing is answered from a stored copy")
+        else:
+            fail(f"only {after - before}/2 requests reached the radio; contacts are being cached")
+        if again == 0:
+            ok("the repeat delta was empty, as a stored-then-forwarded client would see")
+        else:
+            fail(f"repeat delta returned {again} contacts, expected none")
+
+        await c.close()
+    finally:
+        await stop_proc(proc)
+        await ctl.close()
+
+
+async def test_contacts_delta_does_not_cover_a_full_ask(control_port):
+    """Test 29: only attach a client whose ask the streaming reply covers.
+
+    A reply to a `since` request is a delta: it announces the whole table in
+    CONTACT_START but carries only what changed. Attaching a client that asked
+    for the whole book to someone else's delta would hand it that reply -- which
+    is complete-looking (it ends in CONTACT_END, with a plausible count) but
+    missing contacts, and the client has no way to tell. So a delta may only
+    serve an ask for the same watermark or older, and a broader ask is queued
+    for its own dump.
+    """
+    log.info("--- Test 29: a delta reply does not cover a whole-book ask ---")
+    ctl = await connect_control(control_port)
+    max_lastmod = (await ctl.stats()).get("contacts_lastmod_max", 0)
+    base = (await ctl.stats()).get("cmd_counts", {}).get("0x04", 0)
+    # A wide gap keeps the empty delta's CONTACT_END open long enough for B to
+    # ask while the reply is in flight. It stays under the 6 s in-flight
+    # timeout, which is also the contacts-stream stall timeout.
+    await ctl.stream_delay(1500)
+
+    proc, port = await spawn_scratch_proxy("contacts_delta_cover")
+    a = b = None
+    try:
+        if proc is None:
+            fail("contacts-cover proxy did not start")
+            return
+
+        # A asks for a delta. Nothing in the fake radio's list is newer than
+        # max_lastmod, so the reply announces the whole table and sends none.
+        a = await connect_client(port=port)
+        await a.send(b"\x04" + struct.pack("<I", max_lastmod))
+        if not await _wait_for_iter_started(ctl, 5.0):
+            fail("the radio never started streaming the delta reply")
+            return
+
+        # B asks for the whole book while A's delta is in flight. It must NOT
+        # be attached to it: the delta it would receive is empty.
+        b = await connect_client(port=port)
+        await b.send(b"\x04")
+
+        declared_a, frames_a = await read_contacts_reply(a)
+        names_a = [contact_name(f) for f in frames_a if f[0] == 0x03]
+        if not frames_a or frames_a[-1][0] != 0x04 or declared_a <= 0:
+            fail(f"unexpected delta reply: {[hex(f[0]) for f in frames_a]}")
+            return
+        if names_a:
+            fail(f"the delta unexpectedly carried contacts: {names_a}")
+        else:
+            ok(f"client A's delta announced all {declared_a} contacts and sent none")
+
+        declared_b, frames_b = await read_contacts_reply(b)
+        names_b = [contact_name(f) for f in frames_b if f[0] == 0x03]
+        if not frames_b or frames_b[-1][0] != 0x04:
+            fail(f"client B never got a complete reply: {[hex(f[0]) for f in frames_b]}")
+        elif not names_b:
+            fail("client B was attached to A's empty delta instead of getting the book")
+        elif declared_b != declared_a or len(names_b) != declared_a:
+            fail(f"client B's dump was incomplete: {names_b}")
+        else:
+            ok(f"client B was queued for its own dump and got the whole book ({names_b})")
+
+        streams = (await ctl.stats()).get("cmd_counts", {}).get("0x04", 0) - base
+        if streams == 2:
+            ok("the radio saw two GET_CONTACTS: A's delta and B's own dump")
+        else:
+            fail(f"the radio saw {streams} GET_CONTACTS, expected 2")
+    finally:
+        for client in (a, b):
+            if client is not None:
+                await client.close()
+        await ctl.stream_delay(0)
+        await stop_proc(proc)
+        await ctl.close()
+
+
+async def test_factory_reset_invalidates_cached_blobs(proxy_port, control_port):
+    """Test 30: FACTORY_RESET (0x33) invalidates every cached blob.
+
+    0x33 wipes the radio's identity and settings, so the proxy's copies of
+    SELF_INFO / DEVICE_INFO / BATTERY must all be cleared. It is the broadest
+    setter and the easiest to leave out of the invalidation list, because a
+    "reset" reads like a channel/contact concern rather than a settings one.
+    Counting radio reads distinguishes a fresh read from a served copy without
+    depending on the reset changing any particular byte.
+    """
+    log.info("--- Test 30: FACTORY_RESET invalidates the cached blobs ---")
+    ctl = await connect_control(control_port)
+    c = await connect_client(port=proxy_port)
+    await c.appstart()
+
+    async def query_device_info():
+        await c.send(b"\x16\x0d")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5:
+            p = await c.recv(1)
+            if p is None:
+                return None
+            if p[0] == 0x0D:
+                return p
+        return None
+
+    async def query_battery():
+        await c.send(b"\x14")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5:
+            p = await c.recv(1)
+            if p is None:
+                return None
+            if p[0] == 0x0C:
+                return p
+        return None
+
+    async def factory_reset():
+        # The literal "reset" argument is required by the firmware.
+        await c.send(b"\x33reset")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5:
+            p = await c.recv(1)
+            if p is None:
+                return None
+            if p[0] in (0x00, 0x01):
+                return p
+        return None
+
+    # A reset first guarantees both caches start cold, whatever earlier tests
+    # left populated.
+    if await factory_reset() is None:
+        fail("FACTORY_RESET got no reply")
+        await c.close()
+        await ctl.close()
+        return
+    base = (await ctl.stats()).get("cmd_counts", {})
+
+    # First read of each hits the radio; the second is served from cache.
+    await query_device_info()
+    await query_battery()
+    await query_device_info()
+    await query_battery()
+    warm = (await ctl.stats()).get("cmd_counts", {})
+    di_reads = warm.get("0x16", 0) - base.get("0x16", 0)
+    bat_reads = warm.get("0x14", 0) - base.get("0x14", 0)
+    if (di_reads, bat_reads) == (1, 1):
+        ok("each blob was read from the radio once, then served from cache")
+    else:
+        fail(
+            f"expected one radio read each while warming, saw "
+            f"DEVICE_INFO={di_reads} BATTERY={bat_reads}"
+        )
+
+    # The reset clears both caches, so the next read goes to the radio again.
+    if await factory_reset() is None:
+        fail("the second FACTORY_RESET got no reply")
+    await query_device_info()
+    await query_battery()
+    after = (await ctl.stats()).get("cmd_counts", {})
+    di_reread = after.get("0x16", 0) - warm.get("0x16", 0)
+    bat_reread = after.get("0x14", 0) - warm.get("0x14", 0)
+    if (di_reread, bat_reread) == (1, 1):
+        ok("FACTORY_RESET invalidated the cached DEVICE_INFO and BATTERY")
+    else:
+        fail(
+            f"stale blobs after FACTORY_RESET: DEVICE_INFO rereads={di_reread} "
+            f"BATTERY rereads={bat_reread}"
+        )
+
+    await c.close()
+    await ctl.close()
+
+
+# --- Harness ---
+
+_fake_proc = None
+_fake_pid = None
+_fake_port = None
+_control_port = None
+_proxy_proc = None
+_proxy_port = None
+_proxy_args = None
+_history_port = None
+
+
+async def start_fake(port=None):
+    global _fake_proc, _fake_pid, _fake_port, _control_port
+    if port is None:
+        _fake_port = await find_free_port()
+    else:
+        _fake_port = port
+    _control_port = await find_free_port()
+    _fake_proc = await asyncio.create_subprocess_exec(
+        sys.executable, os.path.join(os.path.dirname(__file__), "fake_radio.py"),
+        "--port", str(_fake_port), "--inject",
+        "--control-port", str(_control_port),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    _fake_pid = _fake_proc.pid
+    log.info("Fake radio started (PID=%d, port=%d, control=%d)", _fake_pid, _fake_port, _control_port)
+    if not await wait_for_port(_fake_port):
+        log.error("Fake radio did not come up")
         return False
-    if not await wait_for_port(control_port):
-        log.error("Fake radio control channel no responde")
+    if not await wait_for_port(_control_port):
+        log.error("Fake radio control channel did not come up")
         return False
     return True
 
+
 async def stop_fake():
-    global fake_proc, fake_pid
-    if fake_proc and fake_proc.returncode is None:
-        fake_proc.terminate()
+    global _fake_proc, _fake_pid
+    if _fake_proc and _fake_proc.returncode is None:
+        _fake_proc.terminate()
         try:
-            await asyncio.wait_for(fake_proc.wait(), timeout=5)
+            await asyncio.wait_for(_fake_proc.wait(), timeout=5)
         except asyncio.TimeoutError:
-            fake_proc.kill()
-    fake_proc = None
-    fake_pid = None
+            _fake_proc.kill()
+            await _fake_proc.wait()
+    _fake_proc = None
+    _fake_pid = None
 
 
 async def _pipe_reader(stream, prefix):
@@ -1693,57 +2092,64 @@ async def spawn_proxy():
     history cursor is expected to survive a restart, which is what makes the
     per-listener kv_store entry worth persisting.
     """
-    global proxy_proc
-    proxy_proc = await asyncio.create_subprocess_exec(
-        *proxy_args,
+    global _proxy_proc
+    _proxy_proc = await asyncio.create_subprocess_exec(
+        *_proxy_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    log.info("Proxy started (PID=%d)", proxy_proc.pid)
-    asyncio.create_task(_pipe_reader(proxy_proc.stdout, "[proxy:out]"))
-    asyncio.create_task(_pipe_reader(proxy_proc.stderr, "[proxy:err]"))
+    log.info("Proxy started (PID=%d)", _proxy_proc.pid)
+    asyncio.create_task(_pipe_reader(_proxy_proc.stdout, "[proxy:out]"))
+    asyncio.create_task(_pipe_reader(_proxy_proc.stderr, "[proxy:err]"))
 
-    if not await wait_for_port(proxy_port):
-        log.error("Proxy no responde en puerto %d", proxy_port)
+    if not await wait_for_port(_proxy_port):
+        log.error("Proxy did not come up on port %d", _proxy_port)
         return False
-    log.info("Proxy ready on port %d", proxy_port)
+    log.info("Proxy ready on port %d", _proxy_port)
     return True
 
 
 async def stop_proxy():
-    global proxy_proc
-    if proxy_proc and proxy_proc.returncode is None:
-        proxy_proc.terminate()
+    global _proxy_proc
+    if _proxy_proc and _proxy_proc.returncode is None:
+        _proxy_proc.terminate()
         try:
-            await asyncio.wait_for(proxy_proc.wait(), timeout=5)
+            await asyncio.wait_for(_proxy_proc.wait(), timeout=5)
         except asyncio.TimeoutError:
-            proxy_proc.kill()
-            await proxy_proc.wait()
-    proxy_proc = None
+            _proxy_proc.kill()
+            await _proxy_proc.wait()
+    _proxy_proc = None
 
-async def main():
-    global PASS, FAIL, proxy_proc, proxy_port, proxy_args
+async def _start_session():
+    """Start the shared fake radio and proxy once for the whole run.
 
-    DATA_DIR = f"/tmp/cs_test_proxy/{os.getpid()}"
-    subprocess.run(["rm", "-rf", DATA_DIR], check=False)
+    The suite is one long asyncio session: tests share the radio's state (a
+    channel created in test 2 is still there in test 20) and the fixtures below
+    simply hand each test the current ports. `--listen` gives the history tests
+    a named listener, and the data directory is wiped once so the per-listener
+    cursor has somewhere to resume from.
+    """
+    global _proxy_port, _history_port, _proxy_args
+    data_dir = f"/tmp/cs_test_proxy/{os.getpid()}"
+    subprocess.run(["rm", "-rf", data_dir], check=False)
 
     if not await start_fake():
-        return
+        await stop_fake()
+        pytest.fail("fake radio did not start")
 
-    proxy_port = await find_free_port()
-    history_port = await find_free_port()
-
+    _proxy_port = await find_free_port()
+    _history_port = await find_free_port()
     proxy_bin = os.path.join(
         os.path.dirname(__file__), "..", "target", "debug", "coresplitter"
     )
-    proxy_args = [
+    _proxy_args = [
         proxy_bin,
         "--tcp-backend-host", "127.0.0.1",
-        "--tcp-backend-port", str(fake_port),
-        "--tcp-frontend-port", str(proxy_port),
+        "--tcp-backend-port", str(_fake_port),
+        "--tcp-frontend-port", str(_proxy_port),
         # A named listener: single-client slot with a resumable history.
-        "--listen", f"history:{history_port}",
-        "--data-dir", DATA_DIR,
+        "--listen", f"history:{_history_port}",
+        "--data-dir", data_dir,
         "--log-level", "info",
         # The suite waits this out in test 22; the shipped default of 15 s would
         # only make it slow, and the timeout path is the same either way.
@@ -1751,44 +2157,46 @@ async def main():
     ]
     if not await spawn_proxy():
         await stop_fake()
-        return
+        pytest.fail("proxy did not start")
 
-    await test_multi_client(proxy_port)
-    await test_set_channel(proxy_port)
-    await test_injected_messages(proxy_port)
-    await test_contact_msg_received(proxy_port)
-    await test_get_message_polling(proxy_port)
-    await test_multiple_messages_order(proxy_port)
-    await test_long_message(proxy_port)
-    await test_send_contact_msg(proxy_port)
-    await test_get_msg_fans_out(proxy_port)
-    await test_reconnect_tcp(proxy_port)
-    await test_device_query_negotiation(proxy_port, control_port)
-    await test_unsolicited_pushes_do_not_terminate_requests(proxy_port, control_port)
-    await test_channel_data_fans_out(proxy_port, control_port)
-    await test_setter_invalidates_device_info(proxy_port, control_port)
-    await test_cli_command_invalidates_self_info(proxy_port, control_port)
-    await test_ack_routes_past_in_flight_request(proxy_port, control_port)
-    await test_history_replay(history_port, control_port)
-    await test_history_resume(history_port, control_port)
-    await test_history_survives_restart(history_port, control_port)
-    await test_history_records_local_sends(history_port)
-    await test_history_excludes_live_frames(history_port, control_port)
-    await test_anonymous_listener_never_replays(proxy_port)
-    await test_late_reply_is_not_misattributed(proxy_port, control_port)
-    await test_client_idle_timeout()
-    await test_get_channel_out_of_range_is_local(proxy_port, control_port)
-    await test_client_request_jumps_sync_queue(proxy_port, control_port)
 
-    total = PASS + FAIL
-    log.info("=" * 40)
-    if FAIL == 0:
-        log.info("RESULT: %d/%d PASS", PASS, total)
-    else:
-        log.error("RESULT: %d/%d PASS, %d FAIL", PASS, total, FAIL)
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def harness():
+    """The shared fake radio + proxy, torn down after the last test.
 
+    Autouse so even a single `-k`-selected test gets the full environment. Some
+    tests restart the radio or the proxy mid-run, so teardown stops whatever is
+    running at the end rather than a handle captured at setup.
+    """
+    await _start_session()
+    yield
     await stop_proxy()
     await stop_fake()
 
+
+# Function-scoped on purpose: test_reconnect_tcp restarts the fake radio (with a
+# new control port) and test_client_request_jumps_sync_queue restarts the proxy,
+# so each test must read the *current* port rather than a cached one.
+@pytest.fixture
+def proxy_port(harness):
+    return _proxy_port
+
+
+@pytest.fixture
+def control_port(harness):
+    return _control_port
+
+
+@pytest.fixture
+def history_port(harness):
+    return _history_port
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Running the file directly would import 30 test functions and exit 0
+    # without running any of them. Fail loudly instead.
+    raise SystemExit(
+        "This suite runs under pytest:\n"
+        "    uv run pytest tools/test_proxy.py\n"
+        "    uv run pytest tools/test_proxy.py -k <name>"
+    )

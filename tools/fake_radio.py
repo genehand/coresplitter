@@ -25,6 +25,7 @@ the periodic injector:
 import argparse
 import asyncio
 import collections
+import copy
 import fcntl
 import json
 import os
@@ -61,6 +62,7 @@ DEFAULT_CONTACTS = [
         "lat": 43.3623,
         "lon": -8.4115,
         "last_advert": 0,
+        "lastmod": 1700000100,
     },
     {
         "key": bytes.fromhex("1122334455661122334455661122334455661122334455661122334455661122"),
@@ -69,6 +71,7 @@ DEFAULT_CONTACTS = [
         "lat": 43.3700,
         "lon": -8.4200,
         "last_advert": 0,
+        "lastmod": 1700000200,
     },
 ]
 
@@ -138,14 +141,24 @@ def respond_self_info(node_name: str = "FakeRadio", tx_power: int = 20) -> bytes
     return encode_response(bytes(payload))
 
 
-def respond_contacts() -> list[bytes]:
+def respond_contacts(since: int = 0, contacts: list | None = None) -> list[bytes]:
+    """A CONTACT reply, mirroring MyMesh.cpp's ContactsIterator.
+
+    `since` filters on `lastmod`, and the count in CONTACT_START is the total
+    number of contacts, NOT the filtered count -- the firmware writes
+    `getNumContacts()` there, which is what a client's `since` bookkeeping
+    relies on for its own store.
+    """
+    source = DEFAULT_CONTACTS if contacts is None else contacts
     frames: list[bytes] = []
-    n = len(DEFAULT_CONTACTS)
+    n = len(source)
     start = bytearray([0x02])
     start.extend(struct.pack("<I", n))
     frames.append(encode_response(bytes(start)))
 
-    for c in DEFAULT_CONTACTS:
+    for c in source:
+        if c["lastmod"] <= since:
+            continue  # the iterator still advances, it just does not send
         entry = bytearray()
         entry.append(0x03)
         entry.extend(c["key"])
@@ -158,11 +171,11 @@ def respond_contacts() -> list[bytes]:
         entry.extend(struct.pack("<I", c["last_advert"]))
         entry.extend(struct.pack("<i", int(c["lat"] * 1_000_000)))
         entry.extend(struct.pack("<i", int(c["lon"] * 1_000_000)))
-        entry.extend(b"\x00" * 4)  # last_mod
+        entry.extend(struct.pack("<I", c["lastmod"]))  # [144..148], the `since` field
         frames.append(encode_response(bytes(entry)))
 
     end = bytearray([0x04])
-    end.extend(struct.pack("<I", int(time.time())))
+    end.extend(struct.pack("<I", max((c["lastmod"] for c in source if c["lastmod"] > since), default=0)))
     frames.append(encode_response(bytes(end)))
     return frames
 
@@ -399,6 +412,17 @@ class RadioState:
         self.held_codes: set[int] = set()
         self.held: list[tuple] = []
         self.cmd_counts: collections.Counter = collections.Counter()
+        # Milliseconds between two frames of a CONTACT reply, i.e. between two
+        # main-loop iterations. 0 streams as fast as the socket takes it.
+        self.stream_delay_ms = 0
+        # The one ContactsIterator a real MeshCore instance has. A second
+        # CMD_GET_CONTACTS while it runs is refused the way MyMesh.cpp does.
+        self.iter_started = False
+        self.iter_task = None
+        # `since` of the last CONTACT request, and how many CONTACT frames have
+        # gone out: what a test needs to show that a warm sync is a delta.
+        self.contacts_since = None
+        self.contacts_streamed = 0
 
     async def maybe_delay(self):
         if self.delay_ms:
@@ -412,6 +436,11 @@ class RadioState:
             "node_name": self.node_name,
             "tx_power": self.tx_power,
             "held": len(self.held),
+            "stream_delay_ms": self.stream_delay_ms,
+            "iter_started": self.iter_started,
+            "contacts_since": self.contacts_since,
+            "contacts_streamed": self.contacts_streamed,
+            "contacts_lastmod_max": max((c["lastmod"] for c in DEFAULT_CONTACTS), default=0),
             "cmd_counts": {f"0x{k:02x}": v for k, v in sorted(self.cmd_counts.items())},
         }
 
@@ -483,6 +512,33 @@ class FakeRadio:
                 self._writers.remove(w)
             w.close()
         print(f"[-] TCP desconectado {addr}")
+
+    async def _stream_contacts(self, w, since: int):
+        """Stream a CONTACT reply, one frame per "main-loop iteration".
+
+        MyMesh::checkSerialInterface() advances the contact iterator only on an
+        iteration where no command arrived, so a real radio keeps answering the
+        companion interface while this runs -- and refuses only a second
+        GET_CONTACTS (ERR_CODE_BAD_STATE via `_iter_started`). Sleeping inside
+        the reader loop would model the opposite, so this is its own task.
+        """
+        try:
+            frames = respond_contacts(since)
+            w.write(frames[0])  # CONTACT_START goes out as the command runs
+            await w.drain()
+            for frame in frames[1:]:
+                await asyncio.sleep(self.state.stream_delay_ms / 1000.0)
+                if not self.state.iter_started:
+                    return  # APP_START aborted the iterator
+                if frame[3] == 0x03:
+                    self.state.contacts_streamed += 1
+                w.write(frame)
+                await w.drain()
+        except (ConnectionResetError, asyncio.IncompleteReadError, OSError):
+            pass
+        finally:
+            self.state.iter_started = False
+            self.state.iter_task = None
 
     # -- Serial handler ----------------------------------------------------
 
@@ -575,6 +631,9 @@ class FakeRadio:
 
         match code:
             case 0x01:
+                # MyMesh.cpp stops any left-over ContactsIterator when an app
+                # starts a session; a stream in progress has to notice.
+                self.state.iter_started = False
                 w.write(respond_self_info(self.state.node_name, self.state.tx_power))
                 await w.drain()
 
@@ -590,8 +649,26 @@ class FakeRadio:
                 await w.drain()
 
             case 0x04:
-                for frame in respond_contacts():
-                    w.write(frame)
+                # One ContactsIterator at a time, as in MyMesh.cpp: a second
+                # CMD_GET_CONTACTS while one is running is refused. `since` is
+                # read from an optional trailing u32 and filters on `lastmod`.
+                if self.state.iter_started:
+                    w.write(respond_error(4))
+                else:
+                    since = int.from_bytes(rest[:4], "little") if len(rest) >= 4 else 0
+                    self.state.contacts_since = since
+                    self.state.iter_started = True
+                    self.state.iter_task = asyncio.create_task(self._stream_contacts(w, since))
+                await w.drain()
+
+            case 0x0F:
+                # CMD_REMOVE_CONTACT: a full pubkey, looked up the way
+                # MyMesh.cpp's lookupContactByPubKey does.
+                if any(c["key"] == bytes(rest[:32]) for c in DEFAULT_CONTACTS):
+                    DEFAULT_CONTACTS[:] = [c for c in DEFAULT_CONTACTS if c["key"] != bytes(rest[:32])]
+                    w.write(respond_ok())
+                else:
+                    w.write(respond_error(2))
                 await w.drain()
 
             case 0x05:
@@ -724,6 +801,22 @@ class FakeRadio:
                 w.write(respond_ok())
                 await w.drain()
 
+            case 0x33:
+                # CMD_FACTORY_RESET requires the literal argument "reset"
+                # (`memcmp(&cmd_frame[1], "reset", 5)`); anything else falls
+                # through to ERR_CODE_UNSUPPORTED_CMD. Real firmware then wipes
+                # the filesystem and reboots -- modelled here as resetting the
+                # settings fields, which is all test 30 needs to observe.
+                if rest[:5] != b"reset":
+                    w.write(respond_error(1))
+                else:
+                    self.state.node_name = "FakeRadio"
+                    self.state.tx_power = 20
+                    self.state.repeat = 0
+                    self.state.path_hash_mode = 0
+                    w.write(respond_ok())
+                await w.drain()
+
             case 0x38:
                 w.write(encode_response(b"\x18" + b"\x00" * 20))
                 await w.drain()
@@ -785,6 +878,8 @@ class FakeRadio:
             delay <ms>   hold subsequent command responses for <ms>
             hold <hex>   park matching command codes instead of replying
             release      dispatch every parked command in arrival order
+            stream <ms>  milliseconds between two frames of a CONTACT reply
+            contacts reset  restore the built-in contact list
             push <hex>   write a raw payload to every backend, unframed
             queue <hex>  enqueue a payload for the next GET_MSG (0x0A)
             appver       reply with the negotiated app_target_ver
@@ -816,6 +911,17 @@ class FakeRadio:
                     for hpayload, hw in parked:
                         await self._handle_command(hpayload, hw, count=False)
                     reply = f"released={len(parked)}\n"
+                elif verb == "stream":
+                    self.state.stream_delay_ms = int(arg)
+                    reply = f"stream_delay_ms={self.state.stream_delay_ms}\n"
+                elif verb == "contacts":
+                    # `contacts reset` puts the built-in list back: a test that
+                    # removes a contact must not change what later tests see.
+                    if arg == "reset":
+                        DEFAULT_CONTACTS[:] = copy.deepcopy(CONTACTS_BASELINE)
+                        reply = f"contacts={len(DEFAULT_CONTACTS)}\n"
+                    else:
+                        reply = "err usage: contacts reset\n"
                 elif verb == "push":
                     payload = bytes.fromhex(arg)
                     n = 0
@@ -864,6 +970,7 @@ CMD_NAMES = {
     0x0C: "SetTxPower",
     0x0D: "ResetPath",
     0x0E: "SetCoords",
+    0x0F: "RemoveContact",
     0x14: "GetBattery",
     0x16: "DeviceQuery",
     0x1A: "SendLogin",

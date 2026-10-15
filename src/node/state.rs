@@ -5,16 +5,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, Row, SqlitePool};
 
 #[derive(Debug, Clone, FromRow)]
-pub struct CachedContact {
-    pub public_key: Vec<u8>,
-    pub name: String,
-    pub contact_type: i64,
-    pub last_advert: Option<i64>,
-    pub lat: Option<f64>,
-    pub lon: Option<f64>,
-}
-
-#[derive(Debug, Clone, FromRow)]
 pub struct CachedChannel {
     pub idx: i64,
     pub name: String,
@@ -83,18 +73,16 @@ impl NodeState {
     }
 
     async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS contacts (
-                public_key BLOB PRIMARY KEY,
-                name TEXT NOT NULL,
-                contact_type INTEGER NOT NULL,
-                last_advert INTEGER,
-                lat REAL,
-                lon REAL
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
+        // Contacts are deliberately not stored. The radio answers `GET_CONTACTS`
+        // with a `since` filter and the client keeps the watermark, so a table
+        // here could only ever be a third copy -- one that, once complete, would
+        // answer the request itself and therefore never see another delta to
+        // refresh it from. Contacts are multiplexed, not cached:
+        // `Core::contacts` fans a reply in flight out to everyone asking.
+        // Derived state, so dropping the table an earlier build kept is lossless.
+        sqlx::query("DROP TABLE IF EXISTS contacts")
+            .execute(&self.pool)
+            .await?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS channels (
@@ -201,31 +189,6 @@ impl NodeState {
             .execute(&self.pool)
             .await?;
         Ok(true)
-    }
-
-    // --- Contacts ---
-
-    pub async fn upsert_contact(&self, contact: &CachedContact) -> Result<()> {
-        sqlx::query(
-            "INSERT OR REPLACE INTO contacts (public_key, name, contact_type, last_advert, lat, lon)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(&contact.public_key)
-        .bind(&contact.name)
-        .bind(contact.contact_type)
-        .bind(contact.last_advert)
-        .bind(contact.lat)
-        .bind(contact.lon)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn get_contacts(&self) -> Result<Vec<CachedContact>> {
-        let rows = sqlx::query_as::<_, CachedContact>("SELECT * FROM contacts ORDER BY name")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows)
     }
 
     // --- Channels ---
@@ -589,5 +552,43 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Contacts are multiplexed rather than cached, so an upgrade must drop the
+    /// table an earlier build kept instead of leaving a stale third copy of
+    /// state the radio owns. The migration is destructive on purpose.
+    #[tokio::test]
+    async fn obsolete_contacts_table_is_dropped() {
+        let dir = std::env::temp_dir().join(format!(
+            "coresplitter-state-contacts-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite:{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE contacts (public_key BLOB PRIMARY KEY, name TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO contacts (public_key, name) VALUES (x'01', 'ghost')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let state = NodeState::open(&path).await.unwrap();
+        let table: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'contacts'",
+        )
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(table, None, "the derived contacts table must be dropped");
     }
 }
