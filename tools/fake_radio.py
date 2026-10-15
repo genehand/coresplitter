@@ -38,12 +38,12 @@ import tty
 HOST = "0.0.0.0"
 PORT = 5050
 
-# Mirrors MeshCore companion-v1.17.1 (see examples/companion_radio/MyMesh.h).
-FIRMWARE_VER_CODE = 13
+# Mirrors MeshCore companion-v1.18.0 (see examples/companion_radio/MyMesh.h).
+FIRMWARE_VER_CODE = 14
 MAX_GROUP_CHANNELS = 40
 
 # What the proxy is expected to advertise as `app_target_ver`.
-EXPECTED_APP_TARGET_VER = 13
+EXPECTED_APP_TARGET_VER = 14
 
 # Fixed LoRa-delivery ACK the fake radio hands back in MSG_SENT (RESP_CODE_SENT),
 # so tests can later push the matching PUSH_CODE_SEND_CONFIRMED (0x82) frame.
@@ -113,8 +113,8 @@ def respond_error(code: int = 1) -> bytes:
     return encode_response(bytes([0x01, code]))
 
 
-def respond_self_info() -> bytes:
-    node_name = b"FakeRadio\x00"
+def respond_self_info(node_name: str = "FakeRadio", tx_power: int = 20) -> bytes:
+    name = node_name.encode("utf-8")[:32] + b"\x00"
     pk = bytes.fromhex("deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe")
     lat = int(43.3623 * 1_000_000)
     lon = int(-8.4115 * 1_000_000)
@@ -124,7 +124,7 @@ def respond_self_info() -> bytes:
     payload = bytearray()
     payload.append(0x05)
     payload.append(1)
-    payload.append(20)
+    payload.append(tx_power)
     payload.append(1)
     payload.extend(pk)
     payload.extend(struct.pack("<i", lat))
@@ -134,7 +134,7 @@ def respond_self_info() -> bytes:
     payload.extend(struct.pack("<I", bw))
     payload.append(12)  # sf
     payload.append(5)   # cr
-    payload.extend(node_name)
+    payload.extend(name)
     return encode_response(bytes(payload))
 
 
@@ -171,7 +171,7 @@ def respond_device_info(len_ok: bool = True, repeat: int = 0,
                        path_hash_mode: int = 0) -> bytes:
     """DEVICE_INFO (0x0D), exactly 82 bytes.
 
-    Mirrors MeshCore 1.17.1 MyMesh.cpp handleCmdFrame():
+    Mirrors MeshCore 1.18.0 MyMesh.cpp handleCmdFrame():
       [0]=0x0D  [1]=firmware_ver  [2]=MAX_CONTACTS/2  [3]=MAX_GROUP_CHANNELS
       [4..8]=ble_pin  [8..20]=build_date  [20..60]=manufacturer
       [60..80]=firmware_version  [80]=repeat  [81]=path_hash_mode
@@ -186,9 +186,9 @@ def respond_device_info(len_ok: bool = True, repeat: int = 0,
     payload.append(175)
     payload.append(MAX_GROUP_CHANNELS)
     payload.extend(struct.pack("<I", 0))                 # ble_pin, 4
-    payload.extend(b"19 Apr 2026".ljust(12, b"\x00"))    # build_date, 12
+    payload.extend(b"15 Oct 2026".ljust(12, b"\x00"))    # build_date, 12
     payload.extend(b"Heltec V3".ljust(40, b"\x00"))      # manufacturer, 40
-    payload.extend(b"v1.17.1".ljust(20, b"\x00"))        # fw version, 20
+    payload.extend(b"v1.18.0".ljust(20, b"\x00"))        # fw version, 20
     payload.append(repeat & 0xFF)                          # [80]
     payload.append(path_hash_mode & 0xFF)                  # [81]
     assert len(payload) == 82, f"DEVICE_INFO must be 82 bytes, got {len(payload)}"
@@ -394,6 +394,8 @@ class RadioState:
         self.delay_ms = 0
         self.repeat = 0
         self.path_hash_mode = 0
+        self.node_name = "FakeRadio"
+        self.tx_power = 20
         self.held_codes: set[int] = set()
         self.held: list[tuple] = []
         self.cmd_counts: collections.Counter = collections.Counter()
@@ -407,6 +409,8 @@ class RadioState:
             "app_target_ver": self.app_target_ver,
             "repeat": self.repeat,
             "path_hash_mode": self.path_hash_mode,
+            "node_name": self.node_name,
+            "tx_power": self.tx_power,
             "held": len(self.held),
             "cmd_counts": {f"0x{k:02x}": v for k, v in sorted(self.cmd_counts.items())},
         }
@@ -571,7 +575,7 @@ class FakeRadio:
 
         match code:
             case 0x01:
-                w.write(respond_self_info())
+                w.write(respond_self_info(self.state.node_name, self.state.tx_power))
                 await w.drain()
 
             case 0x02:
@@ -655,6 +659,26 @@ class FakeRadio:
                         w.write(respond_ok())
                 else:
                     w.write(respond_error(6))
+                await w.drain()
+
+            case 0x42:
+                # CMD_RUN_CLI_COMMAND (v14+): the firmware runs the text through
+                # MyMesh::handleCommand and replies RESP_CODE_CLI_REPLY (0x1D).
+                # Mirrors only the subset the tests exercise; it exists so a test
+                # can mutate a cached SELF_INFO/DEVICE_INFO field through the CLI
+                # path rather than the CMD_SET_* handlers.
+                command = rest.decode("utf-8", "replace").strip()
+                if command.startswith("set name "):
+                    self.state.node_name = command[len("set name "):]
+                    reply = b"OK"
+                elif command.startswith("set tx "):
+                    self.state.tx_power = int(command[len("set tx "):])
+                    reply = b"OK"
+                elif command == "get name":
+                    reply = b"> " + self.state.node_name.encode("utf-8")
+                else:
+                    reply = b"Unknown command"
+                w.write(encode_response(b"\x1d" + reply))
                 await w.drain()
 
             case 0x1A:
@@ -850,6 +874,7 @@ CMD_NAMES = {
     0x3D: "SetPathHashMode",
     0x3E: "SendChannelData",
     0x41: "SendRawPacket",
+    0x42: "RunCliCommand",
 }
 
 

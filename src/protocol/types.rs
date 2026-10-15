@@ -61,6 +61,7 @@ pub enum CommandCode {
     SetDefaultFloodScope = 0x3F,
     GetDefaultFloodScope = 0x40,
     SendRawPacket = 0x41,
+    RunCliCommand = 0x42,
 }
 
 impl CommandCode {
@@ -124,6 +125,7 @@ impl CommandCode {
             0x3F => Some(Self::SetDefaultFloodScope),
             0x40 => Some(Self::GetDefaultFloodScope),
             0x41 => Some(Self::SendRawPacket),
+            0x42 => Some(Self::RunCliCommand),
             _ => None,
         }
     }
@@ -190,6 +192,7 @@ impl fmt::Display for CommandCode {
             Self::SetDefaultFloodScope => "CMD_SET_DEFAULT_FLOOD_SCOPE",
             Self::GetDefaultFloodScope => "CMD_GET_DEFAULT_FLOOD_SCOPE",
             Self::SendRawPacket => "CMD_SEND_RAW_PACKET",
+            Self::RunCliCommand => "CMD_RUN_CLI_COMMAND",
         };
         write!(f, "{name}")
     }
@@ -227,6 +230,7 @@ pub enum ResponseCode {
     AllowedRepeatFreq = 0x1A,
     ChannelDataRecv = 0x1B,
     DefaultFloodScope = 0x1C,
+    CliReply = 0x1D,
     Advertisement = 0x80,
     PathUpdate = 0x81,
     Ack = 0x82,
@@ -278,6 +282,7 @@ impl ResponseCode {
             0x1A => Some(Self::AllowedRepeatFreq),
             0x1B => Some(Self::ChannelDataRecv),
             0x1C => Some(Self::DefaultFloodScope),
+            0x1D => Some(Self::CliReply),
             0x80 => Some(Self::Advertisement),
             0x81 => Some(Self::PathUpdate),
             0x82 => Some(Self::Ack),
@@ -332,6 +337,7 @@ impl fmt::Display for ResponseCode {
             Self::AllowedRepeatFreq => "ALLOWED_REPEAT_FREQ",
             Self::ChannelDataRecv => "CHANNEL_DATA_RECV",
             Self::DefaultFloodScope => "DEFAULT_FLOOD_SCOPE",
+            Self::CliReply => "CLI_REPLY",
             Self::Advertisement => "ADVERTISEMENT",
             Self::PathUpdate => "PATH_UPDATE",
             Self::Ack => "ACK",

@@ -46,13 +46,13 @@ const SECS_PER_HOUR: i64 = 3600;
 /// V3 message frames (RESP_CODE_CONTACT_MSG_RECV_V3 0x10 /
 /// RESP_CODE_CHANNEL_MSG_RECV_V3 0x11) over the legacy forms (0x07/0x08).
 ///
-/// 13 matches FIRMWARE_VER_CODE on MeshCore 1.16.0+, which is the version this
-/// proxy reports verbatim to clients inside the cached DEVICE_INFO blob. Pinning
-/// it keeps that consistent: clients told "firmware 13" get V3 frames. Before
-/// this was pinned the radio's `app_target_ver` was whatever the first client to
-/// slip past the cache sent, so the frame type a client saw depended on which
-/// other client connected first.
-const APP_TARGET_VER: u8 = 13;
+/// It mirrors FIRMWARE_VER_CODE (14 on MeshCore 1.18.0), which is the version
+/// this proxy reports verbatim to clients inside the cached DEVICE_INFO blob;
+/// pinning it keeps the two consistent. Before this was pinned the radio's
+/// `app_target_ver` was whatever the first client to slip past the cache sent,
+/// so the frame type a client saw depended on which other client connected
+/// first.
+const APP_TARGET_VER: u8 = 14;
 
 /// Maximum age of a pending_acks entry before it is considered abandoned.
 /// LoRa retransmissions inside the radio top out around ~30 s; five minutes
@@ -69,16 +69,28 @@ const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 /// other client of the frame.
 ///
 /// Only list codes the radio emits *without* a corresponding command. The
-/// borderline cases, checked against MeshCore 1.17.1 `MyMesh.cpp`:
+/// borderline cases, checked against MeshCore 1.18.0 `MyMesh.cpp`:
 ///
 /// * `0x84` RAW_DATA and `0x8E` CONTROL_DATA are inbound-only. The outbound
 ///   commands (`CMD_SEND_RAW_DATA` 0x19, `CMD_SEND_CONTROL_DATA` 0x37) are
 ///   answered with a plain OK, so these codes never belong to a request.
-/// * `0x85`/`0x86` LOGIN_*, `0x87` STATUS_RESPONSE, `0x8B` TELEMETRY_RESPONSE,
-///   `0x8C` BINARY_RESPONSE, `0x8D` PATH_DISCOVERY_RESPONSE and `0x89`
-///   TRACE_DATA look like pushes but are replies the app correlates with a
-///   command it sent (often by matching a tag). Listing any of them would hang
-///   that command forever.
+/// * `0x85`/`0x86` LOGIN_*, `0x87` STATUS_RESPONSE, `0x8B` TELEMETRY_RESPONSE
+///   and `0x89` TRACE_DATA look like pushes but are, or can be, replies the app
+///   correlates with a command it sent (usually by matching a tag). Listing any
+///   of them would hang that command forever. 0x8B is the decisive case: the
+///   `len == 4` "self" form of CMD_SEND_TELEMETRY_REQ is answered with it
+///   directly, and nothing else closes that request.
+/// * `0x8C` BINARY_RESPONSE and `0x8D` PATH_DISCOVERY_RESPONSE *are* pushes,
+///   despite being tag-correlated. Their commands (CMD_SEND_BINARY_REQ 0x32,
+///   CMD_SEND_ANON_REQ 0x39, CMD_SEND_PATH_DISCOVERY_REQ 0x34 and remote
+///   CMD_SEND_TELEMETRY_REQ 0x27) are all answered immediately with
+///   RESP_CODE_SENT (0x06) carrying the tag; the 0x8C/0x8D arrives seconds
+///   later, once the in-flight slot is long free, and the app finds it by tag.
+///   Listing them cannot hang anything -- no command's *direct* reply is 0x8C
+///   or 0x8D -- and leaving them out means a late frame is eaten by whatever
+///   unrelated request happens to be in flight. MeshCore 1.18.0 made that
+///   routine by emitting an unsolicited 0x8C from `onContactResponse` for every
+///   contact response that matches no pending request (e.g. push telemetry).
 /// * `0x82` ACK is listed so `try_route_to_in_flight` declines it and control
 ///   falls through to `try_route_ack`, which routes it to the client that is
 ///   waiting on that `ack_code`. Without this the ACK is eaten by whatever
@@ -91,6 +103,8 @@ const PUSH_EVENT_CODES: &[u8] = &[
     0x84, // RAW_DATA                (push, onRawDataRecv)
     0x88, // LOG_DATA                (push)
     0x8A, // NEW_ADVERT              (push)
+    0x8C, // BINARY_RESPONSE         (tag-correlated push, see above)
+    0x8D, // PATH_DISCOVERY_RESPONSE (tag-correlated push, see above)
     0x8E, // CONTROL_DATA            (push, onControlDataRecv)
     0x8F, // CONTACT_DELETED         (push, onContactOverwrite)
     0x90, // CONTACTS_FULL           (push, onContactsFull)
@@ -1109,10 +1123,20 @@ impl Core {
             //                0x33 factory reset
             //   DEVICE_INFO: 0x25 BLE pin, 0x0B repeat flag, 0x3D path hash
             //                mode, 0x33 factory reset
+            //   both:        0x42 run CLI command
             //
             // 0x3D is easy to miss: CMD_SET_PATH_HASH_MODE writes byte 81 of
-            // DEVICE_INFO (verified against MeshCore 1.17.1 MyMesh.cpp:1459).
-            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 | 0x3D => {
+            // DEVICE_INFO (verified against MeshCore 1.18.0 MyMesh.cpp:1504).
+            //
+            // 0x42 is the same trap from the other side. MeshCore 1.18.0 grew
+            // CMD_RUN_CLI_COMMAND, whose CLI is a second, parallel setter path:
+            // `set name`, `set radio`, `set tx`, `set lat`/`set lon`,
+            // `set multi.acks`, `set path.hash.mode` and `set pin` now reach the
+            // same fields through CommonRadioPrefs::handleCommand instead of the
+            // CMD_SET_* handlers, so none of the arms above fire for them.
+            // Clearing unconditionally is deliberate: a CLI `get ...` costs one
+            // re-read, a CLI `set ...` left cached is served stale forever.
+            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 | 0x3D | 0x42 => {
                 self.self_info_raw = None;
                 self.device_info_raw = None;
                 self.battery_info_raw = None;

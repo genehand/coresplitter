@@ -737,10 +737,10 @@ async def test_device_query_negotiation(proxy_port, control_port):
                 break
 
     for i, p in enumerate(got, start=1):
-        if p[1] == 13:
+        if p[1] == 14:
             ok(f"client {i} DEVICE_INFO served from cache (firmware_ver={p[1]})")
         else:
-            fail(f"client {i} DEVICE_INFO firmware_ver={p[1]}, expected 13")
+            fail(f"client {i} DEVICE_INFO firmware_ver={p[1]}, expected 14")
     if len(got) != 2:
         fail(f"only {len(got)}/2 clients got DEVICE_INFO from the proxy cache")
 
@@ -767,7 +767,16 @@ async def test_unsolicited_pushes_do_not_terminate_requests(proxy_port, control_
     Covers CONTACT_DELETED (0x8F), CONTACTS_FULL (0x90), RAW_DATA (0x84) and
     CONTROL_DATA (0x8E) -- all emitted by the firmware from inbound-traffic
     handlers with no corresponding command (the outbound CMD_SEND_RAW_DATA and
-    CMD_SEND_CONTROL_DATA are answered with a plain OK).
+    CMD_SEND_CONTROL_DATA are answered with a plain OK) -- plus BINARY_RESPONSE
+    (0x8C) and PATH_DISCOVERY_RESPONSE (0x8D).
+
+    0x8C/0x8D are tag-correlated, but the request that triggers them
+    (CMD_SEND_BINARY_REQ 0x32, CMD_SEND_ANON_REQ 0x39,
+    CMD_SEND_PATH_DISCOVERY_REQ 0x34) is answered *immediately* with
+    RESP_CODE_SENT (0x06) carrying the tag; the 0x8C/0x8D arrives later, once the
+    in-flight slot is long free, and the app matches it by tag. So they belong in
+    PUSH_EVENT_CODES too. 1.18.0 made a stray 0x8C routine by emitting one from
+    `onContactResponse` for any contact response that matches no pending request.
 
     `Awaiting::Any` completes a request on any frame not listed in
     PUSH_EVENT_CODES, so a missing code here is delivered only to the one client
@@ -776,7 +785,7 @@ async def test_unsolicited_pushes_do_not_terminate_requests(proxy_port, control_
     that never sent the request.
 
     The idle second client is what makes this observable: it must receive all
-    four pushes, and must NOT receive the reply to c1's request.
+    six pushes, and must NOT receive the reply to c1's request.
     """
     log.info("--- Test 12: unsolicited pushes do not terminate an in-flight request ---")
     ctl = await connect_control(control_port)
@@ -795,8 +804,17 @@ async def test_unsolicited_pushes_do_not_terminate_requests(proxy_port, control_
     await ctl.push("90")                                       # CONTACTS_FULL
     await ctl.push("84" + "0000ff" + b"hi".hex())              # RAW_DATA
     await ctl.push("8e" + "0000ff" + b"hi".hex())              # CONTROL_DATA
+    await ctl.push("8c" + "00" + "efbeadde" + b"hi".hex())     # BINARY_RESPONSE
+    await ctl.push("8d" + "00" + "efbeadde" + b"hi".hex())     # PATH_DISCOVERY_RESPONSE
 
-    expected = {0x8F: "0x8f", 0x90: "0x90", 0x84: "0x84", 0x8E: "0x8e"}
+    expected = {
+        0x8F: "0x8f",
+        0x90: "0x90",
+        0x84: "0x84",
+        0x8E: "0x8e",
+        0x8C: "0x8c",
+        0x8D: "0x8d",
+    }
 
     async def collect(client, want, window):
         out = []
@@ -992,6 +1010,81 @@ async def test_setter_invalidates_device_info(proxy_port, control_port):
         fail(
             "stale DEVICE_INFO served after SET_PATH_HASH_MODE "
             f"(byte 81 = {di2[81] if di2 and len(di2) > 81 else 'missing'}, expected 2)"
+        )
+
+    await c.close()
+    await ctl.close()
+
+
+async def test_cli_command_invalidates_self_info(proxy_port, control_port):
+    """Test 25: CMD_RUN_CLI_COMMAND (0x42) invalidates the cached blobs.
+
+    MeshCore 1.18.0 added a CLI reachable from the companion protocol. Its
+    `set name` / `set radio` / `set tx` / `set lat` / `set multi.acks` /
+    `set path.hash.mode` / `set pin` commands are a second, parallel setter path:
+    they mutate the same SELF_INFO / DEVICE_INFO fields through
+    CommonRadioPrefs::handleCommand, not through the CMD_SET_* handlers, so none
+    of the arms that guard those fields fire. A 0x42 missing from the
+    invalidation list serves the pre-CLI blob to every client forever -- the
+    shape-B bug, with a new trigger.
+    """
+    log.info("--- Test 25: CMD_RUN_CLI_COMMAND invalidates cached SELF_INFO ---")
+    ctl = await connect_control(control_port)
+    c = await connect_client(port=proxy_port)
+    if not await c.appstart():
+        fail("SELF_INFO failed")
+        await c.close()
+        await ctl.close()
+        return
+
+    async def self_info():
+        await c.send(b"\x01\x01" + b"testclient")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5:
+            p = await c.recv(2)
+            if p is None:
+                return None
+            if len(p) and p[0] == 0x05:
+                return p
+        return None
+
+    si = await self_info()
+    if si is not None and len(si) > 2 and si[2] == 20:
+        ok("initial SELF_INFO reports tx_power=20")
+    else:
+        fail(f"unexpected initial SELF_INFO: {si!r}")
+
+    # Change tx_power through the CLI, not through CMD_SET_RADIO_TX_POWER (0x0C).
+    # SELF_INFO byte 2 is the field; no other test reads it, so this does not
+    # leak state into the rest of the suite.
+    await c.send(b"\x42" + b"set tx 17")
+    reply = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await c.recv(1)
+        if p is None:
+            break
+        if len(p) and p[0] == 0x1D:
+            reply = p
+            break
+    if reply is not None and reply[1:] == b"OK":
+        ok("CMD_RUN_CLI_COMMAND 'set tx' → CLI_REPLY (0x1D) OK")
+    else:
+        fail(f"unexpected CLI reply: {reply!r}")
+
+    stats = await ctl.stats()
+    if stats.get("tx_power") == 17:
+        ok("radio applied the CLI tx_power change")
+    else:
+        fail(f"radio tx_power={stats.get('tx_power')!r}, expected 17")
+
+    si2 = await self_info()
+    if si2 is not None and len(si2) > 2 and si2[2] == 17:
+        ok("cached SELF_INFO was invalidated; clients see tx_power=17")
+    else:
+        fail(
+            "stale SELF_INFO served after CMD_RUN_CLI_COMMAND "
+            f"(byte 2 = {si2[2] if si2 is not None and len(si2) > 2 else 'missing'}, expected 17)"
         )
 
     await c.close()
@@ -1616,6 +1709,7 @@ async def main():
     await test_unsolicited_pushes_do_not_terminate_requests(proxy_port, control_port)
     await test_channel_data_fans_out(proxy_port, control_port)
     await test_setter_invalidates_device_info(proxy_port, control_port)
+    await test_cli_command_invalidates_self_info(proxy_port, control_port)
     await test_ack_routes_past_in_flight_request(proxy_port, control_port)
     await test_history_replay(history_port, control_port)
     await test_history_resume(history_port, control_port)

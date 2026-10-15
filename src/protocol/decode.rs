@@ -314,6 +314,7 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
                 0 => "text",
                 1 => "command",
                 2 => "signed",
+                3 => "cli_command",
                 _ => "unknown",
             };
             map.insert("type".into(), DecodedValue::String(type_name.into()));
@@ -421,6 +422,7 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
                 0 => "text",
                 1 => "command",
                 2 => "signed",
+                3 => "cli_command",
                 _ => "unknown",
             };
             map.insert("type".into(), DecodedValue::String(type_name.into()));
@@ -454,6 +456,10 @@ pub fn decode_response_payload(code: u8, payload: &[u8]) -> Option<HashMap<Strin
             let name = String::from_utf8_lossy(&payload[2..2 + name_end]).to_string();
             map.insert("channel_idx".into(), DecodedValue::Integer(idx as i64));
             map.insert("name".into(), DecodedValue::String(name));
+        }
+        0x1D if payload.len() > 1 => {
+            let reply = String::from_utf8_lossy(&payload[1..]).to_string();
+            map.insert("reply".into(), DecodedValue::String(reply));
         }
         0x82 => {
             if payload.len() >= 5 {
