@@ -46,7 +46,9 @@ the physical radio — the proxy acts as a **faithful mirror**.
    `"<name>: "` sender prefix, exactly as `BaseChatMesh::sendGroupMessage`
    writes it on air), and logged for later history replay. If the
    radio is unreachable the originator gets an ERROR and nothing is
-   echoed or persisted.
+   echoed or persisted. The echo is a faithful radio reception and
+   nothing more: attribution is up to the client, see [Message history
+   for named listeners](#message-history-for-named-listeners).
 5. Incoming LoRa traffic: the radio pushes MESSAGES_WAITING (0x83) to
    every client; the first one to poll with GET_MSG retrieves the
    frame and the proxy fans it out to the rest, so every client sees
@@ -100,6 +102,13 @@ coresplitter \
   once a minute, measured on the proxy's clock rather than the sender's
   (LoRa timestamps come from the sender's RTC and can be skewed or
   zero). `0` keeps no history at all.
+
+#### Limitation for sent messages
+
+The replay carries no "sent by me" marker, and a channel frame has no field
+for one. The standard MeshCore client only treats a message as its own when
+it was the one that sent it. The proxy is unable to modify this, so a
+message sent through one listener will appear as incoming on another.
 
 ### Client liveness
 
