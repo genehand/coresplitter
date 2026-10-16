@@ -64,10 +64,10 @@ const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 /// an in-flight request. They are always broadcast to every client.
 ///
 /// Because `try_route_to_in_flight` completes the in-flight request on any code
-/// that is neither listed here nor a contacts-stream frame (`is_request_reply`),
-/// this list is load-bearing: a missing unsolicited code gets delivered to
-/// whichever client happens to have a request in flight and terminates it
-/// early, robbing every other client of the frame.
+/// that is not listed here and that `is_reply_for` does not rule out, this list
+/// is load-bearing: a missing unsolicited code gets delivered to whichever
+/// client happens to have a request in flight and terminates it early, robbing
+/// every other client of the frame.
 ///
 /// Only list codes the radio emits *without* a corresponding command. The
 /// borderline cases, checked against MeshCore 1.18.0 `MyMesh.cpp`:
@@ -140,11 +140,35 @@ fn contacts_since(payload: &[u8]) -> u32 {
     u32::from_le_bytes(payload[1..5].try_into().unwrap_or([0; 4]))
 }
 
-/// Whether a frame from the radio can complete the request in flight, or be the
-/// reply a ghost is waiting to swallow. Push events never can, and neither can
-/// the frames of an open contacts stream.
-fn is_request_reply(code: u8) -> bool {
-    !is_push_event(code) && !is_contacts_frame(code)
+/// Whether `code` can complete a request whose command was `cmd_code`, or be
+/// the reply a ghost filed for that command is waiting to swallow.
+///
+/// Push events never can, and neither can the frames of an open contacts
+/// stream -- with one exception that the command disambiguates.
+/// `RESP_CODE_CONTACT` (0x03) is both an iterator frame of a `GET_CONTACTS`
+/// reply (`MyMesh::checkSerialInterface`) and the answer `CMD_GET_CONTACT_BY_KEY`
+/// (0x1e) gets from `writeContactRespFrame`, so for a 0x1e request it is a reply
+/// and for every other command it is still a stream frame. 0x02/0x04 belong to
+/// the stream alone: every lookup is answered with 0x03.
+///
+/// Matching a 0x03 to the wrong command is why this is command-relative rather
+/// than a flat "is a reply" test. Without the exception the lookup's answer was
+/// never claimed by its own request -- it fell through to the push broadcast --
+/// and the ghost filed for the failed lookup could never claim a 0x03 of its
+/// own, so it sat for `GHOST_TTL` swallowing whatever unrelated reply arrived
+/// next, taking the whole command path down with it.
+///
+/// `try_route_contacts_stream` runs before either matcher, so while a
+/// `GET_CONTACTS` reply is open a 0x03 still goes to its subscribers and a
+/// lookup answered mid-dump keeps the old, ambiguous behaviour.
+fn is_reply_for(cmd_code: u8, code: u8) -> bool {
+    if is_push_event(code) {
+        return false;
+    }
+    if is_contacts_frame(code) {
+        return cmd_code == 0x1E && code == 0x03;
+    }
+    true
 }
 
 /// How much of an open contacts reply is buffered so a client attaching
@@ -1481,20 +1505,26 @@ impl Core {
     /// still owes exactly one reply for that command and answers in order — so
     /// the next frame to arrive is that reply, not the answer to whatever
     /// request is in flight now. Offering it to the live request would hand one
-    /// client another client's answer (`is_request_reply` accepts any non-push,
-    /// non-contacts code) and then broadcast the displaced reply to everybody.
-    /// The owed reply is dropped instead, loudly, and the live request keeps
-    /// waiting for its own.
+    /// client another client's answer and then broadcast the displaced reply to
+    /// everybody: `is_reply_for` accepts any code but the pushes, and the
+    /// stream frames only a lookup can own. The owed reply is dropped instead,
+    /// loudly, and the live request keeps waiting for its own.
+    ///
+    /// The front ghost decides what counts as its reply, because that is not a
+    /// property of the code alone: 0x03 answers a 0x1e lookup and belongs to a
+    /// stream for anybody else (see `is_reply_for`). A frame the front ghost
+    /// cannot own leaves it in place for the command it actually answers.
     ///
     /// Returns true when the frame was accounted for and must not be routed.
     fn try_claim_ghost(&mut self, code: u8, payload: &[u8], logged: Option<i64>) -> bool {
-        if !is_request_reply(code) {
+        let cmd_code = match self.ghosts.front() {
+            Some(owed) => owed.cmd_code,
+            None => return false,
+        };
+        if !is_reply_for(cmd_code, code) {
             return false;
         }
-        let Some(ghost) = self.ghosts.pop_front() else {
-            return false;
-        };
-        let cmd_code = ghost.cmd_code;
+        let ghost = self.ghosts.pop_front().expect("checked non-empty above");
         let late_ms = ghost.since.elapsed().as_millis() as u64;
         tracing::warn!(
             cmd = format_args!("0x{cmd_code:02x}"),
@@ -1642,14 +1672,16 @@ impl Core {
             return false;
         };
 
+        let client_id = in_flight.client_id;
+        let cmd_code = in_flight.cmd_code;
+
         // Push events never complete a request, even with a slot open, and
-        // neither does a frame of the contacts stream running beside it.
-        if !is_request_reply(code) {
+        // neither does a frame of the contacts stream running beside it --
+        // except the 0x03 that answers a 0x1e lookup.
+        if !is_reply_for(cmd_code, code) {
             return false;
         }
 
-        let client_id = in_flight.client_id;
-        let cmd_code = in_flight.cmd_code;
         let elapsed = in_flight.sent_at.elapsed();
         if elapsed >= SLOW_REPLY_WARN {
             tracing::warn!(

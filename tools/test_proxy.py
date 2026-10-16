@@ -94,6 +94,24 @@ class Client:
                 return p
         return None
 
+    async def get_contact_by_key(self, key: bytes, timeout=5.0):
+        """CMD_GET_CONTACT_BY_KEY, answered by RESP_CODE_CONTACT (0x03).
+
+        `MyMesh::handleCmdFrame` answers with `writeContactRespFrame(
+        RESP_CODE_CONTACT, *contact)`, or ERR_CODE_NOT_FOUND -- the lookup reply
+        is the same frame an iterator sends step by step during a GET_CONTACTS
+        dump, which is what makes it easy to mistake for a stream frame.
+        """
+        await self.send(b"\x1e" + key[:32])
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            p = await self.recv(1)
+            if p is None:
+                return None
+            if len(p) and p[0] == 0x03:
+                return p
+        return None
+
     async def send_msg(self, dst: bytes, text: str, ts: int | None = None):
         if ts is None:
             ts = int(time.time())
@@ -262,6 +280,10 @@ def fail(msg):
 
 
 async def test_multi_client(proxy_port):
+    """Test 1: two concurrent clients both receive SELF_INFO.
+
+    A message one of them sends is broadcast to the other.
+    """
     log.info("--- Test 1: Multi-cliente concurrente ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
@@ -314,6 +336,11 @@ async def test_multi_client(proxy_port):
 
 
 async def test_set_channel(proxy_port):
+    """Test 2: SET_CHANNEL persists across a reconnection.
+
+    The channel is created once, then read back from SQLite after the client
+    reconnects.
+    """
     log.info("--- Test 2: SET_CHANNEL + persistence ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
@@ -371,6 +398,11 @@ async def _wait_for_0x83(c, timeout):
 
 
 async def test_injected_messages(proxy_port):
+    """Test 3: an injected channel message arrives via GET_MSG polling.
+
+    The client waits for MESSAGES_WAITING (0x83), then polls GET_MSG and gets
+    CHANNEL_MSG_RECV (0x08).
+    """
     log.info("--- Test 3: Injected channel msg via GET_MSG polling ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
@@ -394,6 +426,10 @@ async def test_injected_messages(proxy_port):
 
 
 async def test_contact_msg_received(proxy_port):
+    """Test 4: as test 3, for an injected contact message.
+
+    Polling GET_MSG after a 0x83 yields CONTACT_MSG_RECV (0x07).
+    """
     log.info("--- Test 4: Injected contact msg via GET_MSG polling ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
@@ -423,6 +459,11 @@ async def test_contact_msg_received(proxy_port):
 
 
 async def test_get_message_polling(proxy_port):
+    """Test 5: GET_MESSAGE (0x0A) polling.
+
+    After a 0x83 tickle, the client polls GET_MESSAGE and receives the queued
+    messages.
+    """
     log.info("--- Test 5: GET_MESSAGE polling (0x0A) ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
@@ -469,6 +510,11 @@ async def test_get_message_polling(proxy_port):
 
 
 async def test_multiple_messages_order(proxy_port):
+    """Test 6: FIFO polling order.
+
+    Two consecutive messages polled from the queue come back in order and have
+    different content.
+    """
     log.info("--- Test 6: Multiple messages in order ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
@@ -503,6 +549,10 @@ async def test_multiple_messages_order(proxy_port):
 
 
 async def test_long_message(proxy_port):
+    """Test 7: a long message (>133 chars) is not truncated on the way out.
+
+    One client sends the long text; the other receives the intact broadcast.
+    """
     log.info("--- Test 7: Long message (>133 chars) ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
@@ -541,6 +591,11 @@ async def test_long_message(proxy_port):
 
 
 async def test_send_contact_msg(proxy_port):
+    """Test 8: contact send (0x02).
+
+    One client sends SEND_MSG and gets MSG_SENT; the other receives the raw
+    payload by broadcast.
+    """
     log.info("--- Test 8: Send contact message (0x02) ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
@@ -581,6 +636,11 @@ async def test_send_contact_msg(proxy_port):
 
 
 async def test_reconnect_tcp(proxy_port):
+    """Test 10: the proxy reconnects after the radio drops the TCP link.
+
+    The fake radio is killed, the proxy is left to reconnect, and GET_CHANNEL
+    must work again once the radio is back.
+    """
     global _fake_proc, _fake_pid, _fake_port
     log.info("--- Test 10: TCP disconnection + reconnection ---")
     c = await connect_client(port=proxy_port)
@@ -627,6 +687,12 @@ async def test_reconnect_tcp(proxy_port):
 
 
 async def test_get_msg_fans_out(proxy_port):
+    """Test 9: a GET_MSG reply fans out to the other clients.
+
+    GET_MSG pops from the radio's single offline queue, so a reply delivered to
+    one client must be broadcast to everyone: one client polls, the other sees
+    the same frame.
+    """
     log.info("--- Test 9: GET_MSG reply fans out to other clients ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
@@ -1185,6 +1251,10 @@ async def drain_history_until_no_more(client, limit: int = 60):
 
 
 async def test_history_replay(history_port, control_port):
+    """Test 16: a named listener replays the logged channel history.
+
+    The replayed frames must be byte-identical to what the radio emitted.
+    """
     log.info("--- Test 16: named listener replays the logged channel history ---")
     ctl = await connect_control(control_port)
     seed = b"History seed one"
@@ -1217,6 +1287,11 @@ async def test_history_replay(history_port, control_port):
 
 
 async def test_history_resume(history_port, control_port):
+    """Test 17: a reconnect resumes history instead of replaying it.
+
+    Reconnecting on the same listener name starts at the persisted cursor, not
+    at the window start.
+    """
     log.info("--- Test 17: a reconnect resumes instead of replaying ---")
     ctl = await connect_control(control_port)
     seed = b"History seed two"
@@ -1244,6 +1319,11 @@ async def test_history_resume(history_port, control_port):
 
 
 async def test_history_survives_restart(history_port, control_port):
+    """Test 18: the per-listener cursor survives a proxy restart.
+
+    With the cursor persisted in kv_store, replay resumes rather than repeats
+    after the restart.
+    """
     log.info("--- Test 18: history cursor survives a proxy restart ---")
     await stop_proxy()
     if not await spawn_proxy():
@@ -1270,6 +1350,12 @@ async def test_history_survives_restart(history_port, control_port):
 
 
 async def test_history_records_local_sends(history_port):
+    """Test 19: a locally sent channel message enters the history.
+
+    The radio never echoes a client's own send back to it, so the proxy logs
+    the synthesized echo, which is replayed to the next client on that
+    listener.
+    """
     log.info("--- Test 19: a locally sent channel message enters the history ---")
     text = "History local send"
     sender = await connect_client(port=history_port)
@@ -1303,6 +1389,12 @@ async def test_history_records_local_sends(history_port):
 
 
 async def test_history_excludes_live_frames(history_port, control_port):
+    """Test 20: frames the client already saw live are not replayed.
+
+    A frame logged before the client connected is replayed; one the client
+    received live is not, so the frozen head watermark is what prevents
+    duplicates.
+    """
     log.info("--- Test 20: frames the client already saw live are not replayed ---")
     ctl = await connect_control(control_port)
 
@@ -1355,6 +1447,11 @@ async def test_history_excludes_live_frames(history_port, control_port):
 
 
 async def test_anonymous_listener_never_replays(proxy_port):
+    """Test 21: the unnamed `--tcp-frontend-port` listener never replays.
+
+    History is a named-listener extension only: a cursor belongs to a listener
+    name, so the anonymous port must serve every client the live behaviour.
+    """
     log.info("--- Test 21: the anonymous listener never replays history ---")
     c = await connect_client(port=proxy_port)
     await c.appstart()
@@ -2025,6 +2122,92 @@ async def test_factory_reset_invalidates_cached_blobs(proxy_port, control_port):
 
     await c.close()
     await ctl.close()
+
+
+async def test_get_contact_by_key(proxy_port):
+    """Test 31: a GET_CONTACT_BY_KEY (0x1e) reply is not a contacts frame.
+
+    `MyMesh::handleCmdFrame` answers CMD_GET_CONTACT_BY_KEY with
+    `writeContactRespFrame(RESP_CODE_CONTACT, *contact)` -- code 0x03, the very
+    frame an iterator step of a GET_CONTACTS reply carries. The proxy keeps
+    0x02-0x04 out of every request's matching so a stray CONTACT frame cannot
+    satisfy the wrong ask, and that exclusion used to swallow the lookup's own
+    answer too: the 0x03 fell through to the push broadcast, the requester was
+    failed with ERROR after the in-flight timeout, and the ghost filed for the
+    lookup -- a command whose reply is a 0x03 -- could never claim its own
+    answer, so it sat for GHOST_TTL eating the next client's reply. From the
+    app that cascade reads as "everything is broken", including the OK to
+    SEND_CHAN_MSG.
+
+    Both halves are asserted, because they fail differently: the lookup is one
+    client's answer and must not reach another, and the slot must be free right
+    after it, not still held or haunted.
+    """
+    log.info("--- Test 31: GET_CONTACT_BY_KEY is a request, not a stream ---")
+
+    # Must match DEFAULT_CONTACTS[0] in the fake radio.
+    alpha_key = bytes.fromhex(
+        "aabbccdd0011aabbccdd0011aabbccdd0011aabbccdd0011aabbccdd0011aabb"
+    )
+
+    requester = await connect_client(port=proxy_port)
+    await requester.appstart()
+    idle = await connect_client(port=proxy_port)
+    await idle.appstart()
+    other = await connect_client(port=proxy_port)
+    await other.appstart()
+
+    async def next_contact(client, span):
+        """The next RESP_CODE_CONTACT frame this client sees, or None."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < span:
+            p = await client.recv(1.0)
+            if p is None:
+                return None
+            if len(p) and p[0] == 0x03:
+                return p
+        return None
+
+    problems = []
+
+    frame = await requester.get_contact_by_key(alpha_key)
+    if frame is None:
+        problems.append("the lookup was never answered with RESP_CODE_CONTACT")
+    elif contact_name(frame) != "Alpha Test":
+        problems.append(
+            f"the lookup answered {contact_name(frame)!r}, expected 'Alpha Test'"
+        )
+
+    # A lookup is one client's answer, not a push. A single-client test cannot
+    # see the difference, which is exactly why the bug survived one.
+    if await next_contact(idle, 2.0) is not None:
+        problems.append("an idle client received another client's CONTACT lookup reply")
+
+    # And the request really finished. Either it is still sitting in the slot
+    # (so this poll queues behind it) or its ghost is, and then the ghost eats
+    # the CURRENT_TIME: neither completes inside the window.
+    await other.send(b"\x05")
+    t0 = time.monotonic()
+    answered = False
+    while time.monotonic() - t0 < 3:
+        p = await other.recv(1.0)
+        if p is None:
+            break
+        if len(p) and p[0] == 0x09:
+            answered = True
+            break
+    if not answered:
+        problems.append(
+            "a second client's CURRENT_TIME was not answered: the lookup still "
+            "held the slot, or its ghost swallowed this reply"
+        )
+
+    for c in (requester, idle, other):
+        await c.close()
+
+    if problems:
+        fail("; ".join(problems))
+    ok("the lookup answered its own client only, and left the slot free")
 
 
 # --- Harness ---

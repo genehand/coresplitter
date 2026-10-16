@@ -14,7 +14,7 @@
 #     Switch to `rust:1.<N>-alpine3.23` if bit-exact reproducibility
 #     of the toolchain is required.
 
-FROM rust:1-alpine3.23 AS builder
+FROM rust:1-alpine3.24 AS builder
 
 # musl-dev pulls in the C toolchain bits libsqlite3-sys needs to
 # bundle SQLite; the rest of the stack is pure Rust.
@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # ----------------------------------------------------------------------
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 RUN addgroup -S -g 10001 coresplitter && \
     adduser -S -G coresplitter -u 10001 coresplitter && \

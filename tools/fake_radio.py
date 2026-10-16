@@ -141,6 +141,29 @@ def respond_self_info(node_name: str = "FakeRadio", tx_power: int = 20) -> bytes
     return encode_response(bytes(payload))
 
 
+def contact_frame(c: dict) -> bytes:
+    """A single RESP_CODE_CONTACT (0x03) frame, as `writeContactRespFrame`
+    writes it.
+
+    The same frame answers a GET_CONTACTS iterator step and
+    CMD_GET_CONTACT_BY_KEY, so both paths must build it identically.
+    """
+    entry = bytearray()
+    entry.append(0x03)
+    entry.extend(c["key"])
+    entry.append(c["type"])
+    entry.append(0)  # flags
+    entry.append(0)  # path_len
+    entry.extend(b"\x00" * 64)  # path
+    name_b = c["name"].encode("utf-8")[:32].ljust(32, b"\x00")
+    entry.extend(name_b)
+    entry.extend(struct.pack("<I", c["last_advert"]))
+    entry.extend(struct.pack("<i", int(c["lat"] * 1_000_000)))
+    entry.extend(struct.pack("<i", int(c["lon"] * 1_000_000)))
+    entry.extend(struct.pack("<I", c["lastmod"]))  # [144..148], the `since` field
+    return encode_response(bytes(entry))
+
+
 def respond_contacts(since: int = 0, contacts: list | None = None) -> list[bytes]:
     """A CONTACT reply, mirroring MyMesh.cpp's ContactsIterator.
 
@@ -159,20 +182,7 @@ def respond_contacts(since: int = 0, contacts: list | None = None) -> list[bytes
     for c in source:
         if c["lastmod"] <= since:
             continue  # the iterator still advances, it just does not send
-        entry = bytearray()
-        entry.append(0x03)
-        entry.extend(c["key"])
-        entry.append(c["type"])
-        entry.append(0)  # flags
-        entry.append(0)  # path_len
-        entry.extend(b"\x00" * 64)  # path
-        name_b = c["name"].encode("utf-8")[:32].ljust(32, b"\x00")
-        entry.extend(name_b)
-        entry.extend(struct.pack("<I", c["last_advert"]))
-        entry.extend(struct.pack("<i", int(c["lat"] * 1_000_000)))
-        entry.extend(struct.pack("<i", int(c["lon"] * 1_000_000)))
-        entry.extend(struct.pack("<I", c["lastmod"]))  # [144..148], the `since` field
-        frames.append(encode_response(bytes(entry)))
+        frames.append(contact_frame(c))
 
     end = bytearray([0x04])
     end.extend(struct.pack("<I", max((c["lastmod"] for c in source if c["lastmod"] > since), default=0)))
@@ -693,6 +703,19 @@ class FakeRadio:
                     w.write(msg)
                 else:
                     w.write(encode_response(b"\x0A"))
+                await w.drain()
+
+            case 0x1E:
+                # CMD_GET_CONTACT_BY_KEY: a full pubkey, looked up the way
+                # MyMesh.cpp's lookupContactByPubKey does, and answered with a
+                # single RESP_CODE_CONTACT frame -- the very same 0x03 an
+                # iterator frame of a GET_CONTACTS reply carries.
+                key = bytes(rest[:32])
+                found = next((c for c in DEFAULT_CONTACTS if c["key"] == key), None)
+                if found is None:
+                    w.write(respond_error(2))
+                else:
+                    w.write(contact_frame(found))
                 await w.drain()
 
             case 0x0B:

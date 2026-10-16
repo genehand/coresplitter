@@ -280,41 +280,6 @@ against the same data directory to prove the replayed cursor survives it.
 Selecting a single test with `-k` still starts the full environment, so a
 targeted run behaves like a fresh deployment.
 
-### Current tests (30)
-
-| # | Test | Description |
-|---|------|-------------|
-| 1 | Multi-client concurrent | Two clients both receive SELF_INFO; one sends a message, the other receives the broadcast |
-| 2 | SET_CHANNEL + persistence | Creates a channel, verifies SQLite persistence after reconnection |
-| 3 | Injected channel msg via GET_MSG | Client waits for 0x83, polls with GET_MSG, gets CHANNEL_MSG_RECV (0x08) |
-| 4 | Injected contact msg via GET_MSG | Same as #3 for CONTACT_MSG_RECV (0x07) |
-| 5 | GET_MESSAGE polling | Client waits for 0x83, sends GET_MESSAGE, receives queued messages |
-| 6 | Multiple messages in order | FIFO polling: two consecutive messages have different content |
-| 7 | Long message (>133 chars) | Two clients: one sends long text, the other receives the intact broadcast |
-| 8 | Contact send (0x02) | Two clients: one sends SEND_MSG, the other receives the raw payload broadcast |
-| 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
-| 10 | TCP reconnection | Kills fake radio, waits for reconnect, verifies GET_CHANNEL works |
-| 11 | DEVICE_QUERY negotiation | The proxy pins `app_target_ver` and serves clients' DEVICE_QUERY from cache, so no client re-negotiates the frame format for the others |
-| 12 | Unsolicited pushes | 0x84/0x8C/0x8D/0x8E/0x8F/0x90 reach an idle client and do not terminate another client's in-flight request |
-| 13 | CHANNEL_DATA_RECV fan-out | A 0x1B group datagram polled by one client is fanned out to the rest |
-| 14 | Setter cache invalidation | SET_PATH_HASH_MODE (0x3D) invalidates the cached DEVICE_INFO instead of leaving it stale |
-| 15 | ACK routing | A late 0x82 ACK reaches its original sender even while another client's request is in flight |
-| 16 | Message history replay | A named listener replays the logged channel history, byte-identical to what the radio emitted |
-| 17 | History resume | A reconnect on the same listener name starts at the cursor instead of the window start |
-| 18 | History across restart | The per-listener cursor survives a proxy restart, so replay resumes rather than repeats |
-| 19 | Local sends in history | A channel message sent by one client is replayed to the next client on that listener |
-| 20 | Live frames not replayed | A frame logged before the client connected is replayed; one it already saw live is not |
-| 21 | Anonymous listener | The unnamed `--tcp-frontend-port` listener never replays history |
-| 22 | Late reply discarded | A reply arriving after the in-flight timeout is dropped instead of answering another client's request |
-| 23 | Client idle timeout | A silent client is reaped while a polling one on the same proxy outlives the sweep |
-| 24 | Out-of-range GET_CHANNEL | Only `idx >= max_channels` is answered locally with NOT_FOUND; idx 39 still reaches the cache and nothing in the test touches the radio |
-| 25 | CLI invalidation | CMD_RUN_CLI_COMMAND (0x42) clears the cached SELF_INFO/DEVICE_INFO, since the CLI is a second setter path |
-| 26 | Client request jumps the sync queue | With the radio slowed to 400 ms per command, a client's non-cacheable request is answered immediately instead of waiting for the proxy's own channel sync to drain |
-| 27 | Contacts stream runs beside commands | With the contact reply slowed to 2 s per frame, a normal command is still answered at once, a client asking mid-stream is attached and receives the whole book, and the radio only ever sees one `GET_CONTACTS` |
-| 28 | Contacts are client-driven | The proxy never prefetches or stores contacts; a client's `since` reaches the radio unchanged and a repeat request still goes to the radio |
-| 29 | Delta does not cover a full ask | A client asking for the whole book is not attached to someone else's empty delta; it is queued and gets its own full dump |
-| 30 | Factory reset invalidates cache | FACTORY_RESET (0x33) clears the cached DEVICE_INFO and BATTERY instead of serving them stale |
-
 ### Fake radio
 
 ```bash
