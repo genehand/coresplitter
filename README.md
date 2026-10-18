@@ -119,6 +119,11 @@ coresplitter \
 - Only channel messages are replayed. Contact frames are logged but not
   replayed, because the V3 contact form carries a variable-length
   sender prefix for signed messages.
+- Nothing is written to the message log unless a listener replays it. The
+  insert is a commit on the path that hands the frame to every client
+  (~0.35 ms of each poll), and with no named listener no cursor could ever
+  read the row back. `--tcp-frontend-port`-only deployments therefore pay
+  nothing for history, and the log starts when you add a `--listen`.
 - Logged messages older than `--message-history-hours` are pruned about
   once a minute, measured on the proxy's clock rather than the sender's
   (LoRa timestamps come from the sender's RTC and can be skewed or

@@ -277,6 +277,10 @@ pub struct CoreConfig {
     /// Retention window: how far back a named listener may replay, and the age
     /// at which logged messages are pruned.
     pub message_history_hours: u64,
+    /// Whether any listener replays history at all. When none does, every row
+    /// the log would hold is unreadable: no cursor exists to replay it, so the
+    /// inserts are pure latency on the path that delivers each frame.
+    pub log_messages: bool,
     /// How long a client request may occupy the in-flight slot before it is
     /// failed with ERROR. See `--in-flight-timeout`.
     pub in_flight_timeout: Duration,
@@ -1007,6 +1011,26 @@ impl Core {
         }
     }
 
+    /// Write a message frame to the log that history replay reads back.
+    ///
+    /// Skipped outright when no listener replays history (`log_messages`): the
+    /// row could never be served to anybody, and an insert on this path is an
+    /// fsync that every client waits for. It is not free either way -- a
+    /// one-message-per-poll drain pays it once per poll -- so the frontend-only
+    /// deployment, which is the common one, should not pay it at all.
+    async fn log_message(&self, msg: &NewMessage<'_>, what: &str) -> Option<i64> {
+        if !self.config.log_messages {
+            return None;
+        }
+        match self.state.insert_message(msg).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to cache {what}");
+                None
+            }
+        }
+    }
+
     /// Answer CMD_SYNC_NEXT_MESSAGE (0x0A) from the message log while a client
     /// on a named listener is still catching up.
     ///
@@ -1340,18 +1364,20 @@ impl Core {
 
         // The sender is excluded from its own echo, so it is credited for
         // every other client but not for this frame.
-        if let Ok(id) = self
-            .state
-            .insert_message(&NewMessage {
-                msg_type: "contact",
-                from_key: Some(from_key),
-                channel_idx: None,
-                text: &text,
-                timestamp: ts,
-                raw: &fake,
-                code: 0x07,
-                recv_ts: chrono::Utc::now().timestamp(),
-            })
+        if let Some(id) = self
+            .log_message(
+                &NewMessage {
+                    msg_type: "contact",
+                    from_key: Some(from_key),
+                    channel_idx: None,
+                    text: &text,
+                    timestamp: ts,
+                    raw: &fake,
+                    code: 0x07,
+                    recv_ts: chrono::Utc::now().timestamp(),
+                },
+                "contact echo",
+            )
             .await
         {
             self.credit_history_receipts(id, Some(sender));
@@ -1397,18 +1423,20 @@ impl Core {
         // The sender is excluded from its own echo, so it is credited for
         // every other client but not for this frame: its own message is still
         // replayed to it if it ever syncs the history back.
-        if let Ok(id) = self
-            .state
-            .insert_message(&NewMessage {
-                msg_type: "channel",
-                from_key: Some(from_key),
-                channel_idx: Some(channel),
-                text: &text,
-                timestamp: ts,
-                raw: &fake,
-                code: 0x11,
-                recv_ts: chrono::Utc::now().timestamp(),
-            })
+        if let Some(id) = self
+            .log_message(
+                &NewMessage {
+                    msg_type: "channel",
+                    from_key: Some(from_key),
+                    channel_idx: Some(channel),
+                    text: &text,
+                    timestamp: ts,
+                    raw: &fake,
+                    code: 0x11,
+                    recv_ts: chrono::Utc::now().timestamp(),
+                },
+                "channel echo",
+            )
             .await
         {
             self.credit_history_receipts(id, Some(sender));
@@ -1892,23 +1920,21 @@ impl Core {
                         })
                         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-                    match self
-                        .state
-                        .insert_message(&NewMessage {
-                            msg_type: "contact",
-                            from_key: from_key.as_deref(),
-                            channel_idx: None,
-                            text: &text,
-                            timestamp: ts,
-                            raw: payload,
-                            code,
-                            recv_ts,
-                        })
-                        .await
-                    {
-                        Ok(id) => logged = Some(id),
-                        Err(e) => tracing::warn!(error = %e, "failed to cache message"),
-                    }
+                    logged = self
+                        .log_message(
+                            &NewMessage {
+                                msg_type: "contact",
+                                from_key: from_key.as_deref(),
+                                channel_idx: None,
+                                text: &text,
+                                timestamp: ts,
+                                raw: payload,
+                                code,
+                                recv_ts,
+                            },
+                            "message",
+                        )
+                        .await;
                 }
             }
             0x08 => {
@@ -1932,23 +1958,21 @@ impl Core {
                         })
                         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-                    match self
-                        .state
-                        .insert_message(&NewMessage {
-                            msg_type: "channel",
-                            from_key: None,
-                            channel_idx,
-                            text: &text,
-                            timestamp: ts,
-                            raw: payload,
-                            code,
-                            recv_ts,
-                        })
-                        .await
-                    {
-                        Ok(id) => logged = Some(id),
-                        Err(e) => tracing::warn!(error = %e, "failed to cache channel message"),
-                    }
+                    logged = self
+                        .log_message(
+                            &NewMessage {
+                                msg_type: "channel",
+                                from_key: None,
+                                channel_idx,
+                                text: &text,
+                                timestamp: ts,
+                                raw: payload,
+                                code,
+                                recv_ts,
+                            },
+                            "channel message",
+                        )
+                        .await;
                 }
             }
             0x10 if payload.len() >= 13 => {
@@ -1961,23 +1985,21 @@ impl Core {
                 } else {
                     String::new()
                 };
-                match self
-                    .state
-                    .insert_message(&NewMessage {
-                        msg_type: "contact",
-                        from_key: from_key.as_deref(),
-                        channel_idx: None,
-                        text: &text,
-                        timestamp: ts,
-                        raw: payload,
-                        code,
-                        recv_ts,
-                    })
-                    .await
-                {
-                    Ok(id) => logged = Some(id),
-                    Err(e) => tracing::warn!(error = %e, "failed to cache V3 contact message"),
-                }
+                logged = self
+                    .log_message(
+                        &NewMessage {
+                            msg_type: "contact",
+                            from_key: from_key.as_deref(),
+                            channel_idx: None,
+                            text: &text,
+                            timestamp: ts,
+                            raw: payload,
+                            code,
+                            recv_ts,
+                        },
+                        "V3 contact message",
+                    )
+                    .await;
             }
             0x11 if payload.len() >= 11 => {
                 let channel_idx = payload[4] as i64;
@@ -1987,23 +2009,21 @@ impl Core {
                 } else {
                     String::new()
                 };
-                match self
-                    .state
-                    .insert_message(&NewMessage {
-                        msg_type: "channel",
-                        from_key: None,
-                        channel_idx: Some(channel_idx),
-                        text: &text,
-                        timestamp: ts,
-                        raw: payload,
-                        code,
-                        recv_ts,
-                    })
-                    .await
-                {
-                    Ok(id) => logged = Some(id),
-                    Err(e) => tracing::warn!(error = %e, "failed to cache V3 channel message"),
-                }
+                logged = self
+                    .log_message(
+                        &NewMessage {
+                            msg_type: "channel",
+                            from_key: None,
+                            channel_idx: Some(channel_idx),
+                            text: &text,
+                            timestamp: ts,
+                            raw: payload,
+                            code,
+                            recv_ts,
+                        },
+                        "V3 channel message",
+                    )
+                    .await;
             }
             0x12 if payload.len() >= 50 => {
                 let idx = payload[1] as i64;

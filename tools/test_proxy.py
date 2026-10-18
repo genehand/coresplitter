@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -1747,11 +1748,13 @@ async def read_contacts_reply(client, timeout=8.0):
     return declared, frames
 
 
-async def spawn_scratch_proxy(tag, timeout="6"):
+async def spawn_scratch_proxy(tag, timeout="6", extra_args=()):
     """A proxy on its own port and its own (fresh) data directory.
 
     Needed wherever cache state is the thing under test: the suite's shared
-    proxy has been warming its own caches for twenty tests by then.
+    proxy has been warming its own caches for twenty tests by then. Returns the
+    data directory too, because some of that state lives in SQLite rather than
+    in RAM.
     """
     port = await find_free_port()
     data_dir = f"/tmp/cs_test_proxy/{os.getpid()}/{tag}"
@@ -1764,12 +1767,13 @@ async def spawn_scratch_proxy(tag, timeout="6"):
         "--data-dir", data_dir,
         "--log-level", "info",
         "--in-flight-timeout", timeout,
+        *extra_args,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
     if not await wait_for_port(port):
-        return None, port
-    return proc, port
+        return None, port, data_dir
+    return proc, port, data_dir
 
 
 async def stop_proc(proc):
@@ -1797,7 +1801,7 @@ async def test_contacts_stream_runs_beside_requests(control_port):
     # 2000 ms per frame puts CONTACT_END ~6 s out.
     await ctl.stream_delay(2000)
 
-    proc, port = await spawn_scratch_proxy("contacts_stream")
+    proc, port, _ = await spawn_scratch_proxy("contacts_stream")
     a = b = c = None
     try:
         if proc is None:
@@ -1893,7 +1897,7 @@ async def test_contacts_are_client_driven(control_port):
     base = (await ctl.stats()).get("cmd_counts", {})
     max_lastmod = (await ctl.stats()).get("contacts_lastmod_max", 0)
 
-    proc, port = await spawn_scratch_proxy("contacts_client_driven")
+    proc, port, _ = await spawn_scratch_proxy("contacts_client_driven")
     try:
         if proc is None:
             fail("contacts proxy did not start")
@@ -1975,7 +1979,7 @@ async def test_contacts_delta_does_not_cover_a_full_ask(control_port):
     # timeout, which is also the contacts-stream stall timeout.
     await ctl.stream_delay(1500)
 
-    proc, port = await spawn_scratch_proxy("contacts_delta_cover")
+    proc, port, _ = await spawn_scratch_proxy("contacts_delta_cover")
     a = b = None
     try:
         if proc is None:
@@ -2208,6 +2212,73 @@ async def test_get_contact_by_key(proxy_port):
     if problems:
         fail("; ".join(problems))
     ok("the lookup answered its own client only, and left the slot free")
+
+
+async def test_no_listener_means_no_message_log(control_port):
+    """Test 32: with no listener replaying history, message frames are not logged.
+
+    Every message frame is inserted into `messages` on the path that hands it to
+    the clients, and that insert is a commit: ~0.35 ms of the ~0.5 ms that each
+    poll of a one-message-per-poll drain costs. Nothing reads the row back
+    unless a named listener replays history, so a frontend-only deployment must
+    not pay for it at all.
+
+    Both halves of the gate are asserted with the same frame and the same
+    client flow, because the skip alone would also be produced by a frame that
+    never reached the logging arm: the client has to receive the message either
+    way, and the only difference is whether a listener exists.
+    """
+    log.info("--- Test 32: no replaying listener, no message log ---")
+    ctl = await connect_control(control_port)
+    # 0x11 CHANNEL_MSG_RECV_V3, the generation the proxy pins app_target_ver to:
+    # [0]=code [1]=snr [2..4]=reserved [4]=chan [5]=path_len [6]=txt_type
+    # [7..11]=timestamp [11..]=text
+    ts = struct.pack("<I", int(time.time()))
+    frame = bytes([0x11, 0, 0, 0, 0, 0, 0]) + ts + b"not logged"
+
+    async def exchanged_and_rows(tag, extra_args=()):
+        """Deliver one message through a fresh proxy; return rows in its log."""
+        proc, port, data_dir = await spawn_scratch_proxy(tag, extra_args=extra_args)
+        if proc is None:
+            return None, f"the {tag} proxy never came up"
+        try:
+            c = await connect_client(port=port)
+            if not await c.appstart():
+                return None, f"the {tag} proxy did not answer APP_START"
+            await ctl.queue(frame.hex())
+            msg = await c.get_message()
+            await c.close()
+            if msg is None or msg[0] not in CHANNEL_MSG_CODES:
+                got = msg.hex() if msg else "None"
+                return None, f"the {tag} client never got the message ({got})"
+            await stop_proc(proc)
+            proc = None
+        finally:
+            await stop_proc(proc)
+        db = os.path.join(data_dir, "state.db")
+        with sqlite3.connect(db) as conn:
+            return conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], None
+
+    problems = []
+    rows, err = await exchanged_and_rows("no_listener")
+    if err:
+        problems.append(err)
+    elif rows != 0:
+        problems.append(f"a frame was logged with no listener to replay it ({rows} rows)")
+
+    # Same frame, same client, but a named listener exists: now it must be kept.
+    listener_port = await find_free_port()
+    rows, err = await exchanged_and_rows(
+        "with_listener", extra_args=("--listen", f"logging:{listener_port}")
+    )
+    if err:
+        problems.append(err)
+    elif rows != 1:
+        problems.append(f"a listener that replays history got {rows} rows, expected 1")
+
+    if problems:
+        fail("; ".join(problems))
+    ok("message frames are logged only when a listener can replay them")
 
 
 # --- Harness ---

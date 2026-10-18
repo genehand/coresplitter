@@ -159,6 +159,11 @@ impl Cli {
             }
         }
 
+        // Nothing reads the message log unless a listener replays it, and the
+        // insert sits on the path that delivers each frame, so a deployment
+        // with no named listener should not pay for it at all.
+        let log_messages = parsed.iter().any(|(p, _)| p.replays_history());
+
         Ok(CoreConfig {
             backend_type,
             serial_port: self.serial,
@@ -171,6 +176,7 @@ impl Cli {
             tcp_frontend_port: self.tcp_frontend_port,
             listeners: parsed.into_iter().map(|(profile, _)| profile).collect(),
             message_history_hours: self.message_history_hours,
+            log_messages,
             in_flight_timeout: Duration::from_secs(self.in_flight_timeout.max(1)),
             client_idle_timeout: Duration::from_secs(self.client_idle_timeout),
             data_dir: self.data_dir,

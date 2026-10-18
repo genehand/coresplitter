@@ -13,6 +13,15 @@ pub async fn connect(host: &str, port: u16) -> Result<RadioIo> {
     let stream = TcpStream::connect(&addr)
         .await
         .context(format!("failed to connect to TCP backend at {addr}"))?;
+    // The frontend sets this for its clients, and so do the software radios on
+    // the other end -- openhop does it explicitly for VPN/Tailscale links. Here
+    // it is inert while the one-command-in-flight rule holds: each write is the
+    // only unacknowledged small segment, so Nagle has nothing to hold it
+    // behind. It becomes load-bearing the moment two commands are written
+    // without a reply in between (a cache warm-up, or a prefetched 0x0A burst),
+    // because then the second waits out Nagle's timer against the peer's
+    // delayed ACK -- up to ~40 ms.
+    let _ = stream.set_nodelay(true);
 
     let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (recv_tx, recv_rx) = mpsc::unbounded_channel::<Vec<u8>>();
