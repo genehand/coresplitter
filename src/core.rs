@@ -288,6 +288,10 @@ pub struct CoreConfig {
     /// How long a client request may occupy the in-flight slot before it is
     /// failed with ERROR. See `--in-flight-timeout`.
     pub in_flight_timeout: Duration,
+    /// How long a client connection may go without sending a command before
+    /// the frontend closes it. Zero disables the sweep. See
+    /// `--client-idle-timeout`.
+    pub client_idle_timeout: Duration,
     /// Whether a GET_CONTACTS may be answered from the SQLite contact cache.
     /// Off (`--no-contact-cache`) forwards every ask to the radio instead, so
     /// the client always sees the live reply and the proxy keeps no second
@@ -450,6 +454,7 @@ impl Core {
             self.client_channels.clone(),
             self.radio_up_tx.subscribe(),
             shutdown_rx,
+            self.config.client_idle_timeout,
         );
         tokio::spawn(async move {
             if let Err(e) = frontend.run().await {
@@ -936,6 +941,21 @@ impl Core {
                 } else {
                     -1
                 };
+                // `BaseChatMesh::getChannel` refuses every idx >=
+                // MAX_GROUP_CHANNELS, so the radio can only answer
+                // ERR_CODE_NOT_FOUND for these. Reply it here and keep a doomed
+                // request off the single in-flight slot. (An in-range but empty
+                // slot is a different case: the radio may still hold a channel
+                // the cache has not seen, so that one forwards.)
+                if requested_idx >= i64::from(self.max_channels) {
+                    tracing::debug!(
+                        idx = requested_idx,
+                        max_channels = self.max_channels,
+                        "GET_CHANNEL out of range, replying locally"
+                    );
+                    self.send_to_client(client_id, vec![0x01, 0x02]);
+                    return true;
+                }
                 if let Ok(channels) = self.state.get_channels().await
                     && let Some(ch) = channels.iter().find(|c| c.idx == requested_idx)
                 {
