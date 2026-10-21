@@ -202,7 +202,8 @@ pub enum ResponseCode {
     AutoaddConfig = 0x19,
     AllowedRepeatFreq = 0x1A,
     ChannelDataRecv = 0x1B,
-    ConnectionStatus = 0x1C,
+    DefaultFloodScope = 0x1C,
+    CliReply = 0x1D,
     BinaryReq = 0x32,
     PathDiscovery = 0x34,
     Advertisement = 0x80,
@@ -220,7 +221,7 @@ pub enum ResponseCode {
     BinaryResponse = 0x8C,
     PathDiscoveryResponse = 0x8D,
     ControlData = 0x8E,
-    AdvertResponse = 0x8F,
+    ContactDeleted = 0x8F,
     ContactsFull = 0x90,
 }
 
@@ -255,7 +256,8 @@ impl ResponseCode {
             0x19 => Some(Self::AutoaddConfig),
             0x1A => Some(Self::AllowedRepeatFreq),
             0x1B => Some(Self::ChannelDataRecv),
-            0x1C => Some(Self::ConnectionStatus),
+            0x1C => Some(Self::DefaultFloodScope),
+            0x1D => Some(Self::CliReply),
             0x32 => Some(Self::BinaryReq),
             0x34 => Some(Self::PathDiscovery),
             0x80 => Some(Self::Advertisement),
@@ -273,7 +275,7 @@ impl ResponseCode {
             0x8C => Some(Self::BinaryResponse),
             0x8D => Some(Self::PathDiscoveryResponse),
             0x8E => Some(Self::ControlData),
-            0x8F => Some(Self::AdvertResponse),
+            0x8F => Some(Self::ContactDeleted),
             0x90 => Some(Self::ContactsFull),
             _ => None,
         }
@@ -311,7 +313,8 @@ impl fmt::Display for ResponseCode {
             Self::AutoaddConfig => "AUTOADD_CONFIG",
             Self::AllowedRepeatFreq => "ALLOWED_REPEAT_FREQ",
             Self::ChannelDataRecv => "CHANNEL_DATA_RECV",
-            Self::ConnectionStatus => "CONNECTION_STATUS",
+            Self::DefaultFloodScope => "DEFAULT_FLOOD_SCOPE",
+            Self::CliReply => "CLI_REPLY",
             Self::BinaryReq => "BINARY_REQ",
             Self::PathDiscovery => "PATH_DISCOVERY",
             Self::Advertisement => "ADVERTISEMENT",
@@ -329,7 +332,7 @@ impl fmt::Display for ResponseCode {
             Self::BinaryResponse => "BINARY_RESPONSE",
             Self::PathDiscoveryResponse => "PATH_DISCOVERY_RESPONSE",
             Self::ControlData => "CONTROL_DATA",
-            Self::AdvertResponse => "ADVERT_RESPONSE",
+            Self::ContactDeleted => "CONTACT_DELETED",
             Self::ContactsFull => "CONTACTS_FULL",
         };
         write!(f, "{name}")
