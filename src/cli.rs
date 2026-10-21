@@ -72,7 +72,7 @@ pub struct Cli {
     /// Days to keep stored messages (0 = forever)
     #[arg(
         long,
-        default_value_t = 30,
+        default_value_t = 0,
         env = "CORESPLITTER_MESSAGES_RETENTION_DAYS"
     )]
     pub messages_retention_days: u32,
