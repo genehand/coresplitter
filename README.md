@@ -24,23 +24,46 @@ the physical radio — the proxy acts as a **faithful mirror**.
 1. Proxy connects to the physical radio and syncs contacts and channels
    into SQLite at startup (and again after each reconnect). The sync
    commands are queued through the same FIFO as client commands so their
-   responses never interleave with a real client request.
+   responses never interleave with a real client request. A client's
+   request jumps ahead of the entries the sync left queued -- the radio
+   answers one command per loop, so a request behind a
+   `max_channels`-long sync would wait seconds for work it did not ask
+   for -- except the reads the cache can answer, which keep their place
+   because the sync is filling those very entries.
 2. Opens a TCP server for companion clients to connect to.
 3. Client commands are served from cache when possible (SELF_INFO,
    DEVICE_INFO, BATTERY, GET_CONTACTS, GET_CHANNEL); the rest are
    serialized through a FIFO queue and forwarded one at a time to the
    radio. The radio's reply is routed back to the originating client.
+   `GET_CHANNEL` past the radio's `max_channels` is answered locally
+   with NOT_FOUND: `BaseChatMesh::getChannel` refuses every such idx, so
+   forwarding it would only earn the same ERROR and keep an app walking
+   to the end of its channel list on the radio's single slot.
+   A `GET_CONTACTS` reply is the one multi-frame reply: it stays in the
+   in-flight slot until `END_OF_CONTACTS`, and the timeout is measured
+   from the last frame, so a long dump over a slow link is not cut off
+   while frames keep arriving.
    If the radio disconnects, any in-flight or queued client request is
    failed immediately with ERROR, every client connection is closed and
    the TCP frontend stops listening until the radio is back. MeshCore
    has no "device unavailable" frame, so the proxy behaves like an
-   absent node rather than serving a radio it doesn't have.
+   absent node rather than serving a radio it doesn't have. A request
+   the radio answers too late to beat `--in-flight-timeout` is failed
+   the same way; its reply is then swallowed by a "ghost" so it cannot be
+   handed to whichever client happens to be waiting next.
 4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG): once the radio accepts
    the message (MSG_SENT for SEND_MSG, OK for SEND_CHAN_MSG), a
    synthetic CONTACT_MSG_RECV / CHANNEL_MSG_RECV is echoed to the other
-   clients so they see the message as if it had arrived over LoRa. If
-   the radio rejects it or is unreachable, the originator gets the
-   ERROR and nothing is echoed or persisted.
+   clients so they see the message as if it had arrived over LoRa, with
+   the radio's `"<node_name>: "` prefix on channel messages because that
+   prefix is the only sender identity a channel frame carries. If the
+   radio rejects it or is unreachable, the originator gets the ERROR and
+   nothing is echoed or persisted.
+   A retried send is echoed once: the client reuses the timestamp, which
+   makes it the same on-air packet (`BaseChatMesh::sendGroupMessage`
+   mixes the timestamp in so a retransmission is recognisable, and the
+   firmware's `wasSeen` table drops the copy), so the proxy keeps the
+   last 160 send payloads and skips an exact repeat.
 5. Incoming LoRa traffic: the radio pushes MESSAGES_WAITING (0x83) to
    every client; the first one to poll with GET_MSG retrieves the
    frame and the proxy fans it out to the rest, so every client sees
@@ -63,6 +86,31 @@ the physical radio — the proxy acts as a **faithful mirror**.
    official app) look identical on one port; give each its own port
    with `--tcp-frontend-port 5000,5001`. What a never-seen client gets
    is set with `CORESPLITTER_NEW_CLIENT_BACKLOG`.
+   The cursor a client resumes from only moves as far as the client
+   proved it read. TCP delivers in order, so a command proves every
+   frame written before it arrived and says nothing about frames
+   written after; the proxy persists that watermark once a second and
+   only drops it when the connection ends. A socket that dies without a
+   FIN -- a laptop moving from ethernet to wifi -- therefore costs a
+   duplicate at worst on the next connect, never a skipped message.
+
+### Contact cache
+
+Contacts are cached by default: `GET_CONTACTS` is answered from SQLite
+with the frames the radio sent, `since` filtering applied the way the
+firmware applies it, and the list is refreshed when the radio reports a
+change (`ADD_UPDATE_CONTACT`, `RESET_PATH`, `IMPORT_CONTACT`,
+`ADVERTISEMENT`, `PATH_UPDATE`). `REMOVE_CONTACT` purges the cached row.
+
+`--no-contact-cache` (`CORESPLITTER_CACHE_CONTACTS=false`) turns the
+whole path off: every `GET_CONTACTS` is forwarded with the client's own
+`since` watermark, nothing is prefetched at startup, and no contact
+frames are stored. Use it when clients must always see the radio's live
+reply, or when the radio's own `lastmod` bookkeeping is the single
+source of truth:
+```bash
+coresplitter --tcp-backend-host 192.168.1.100 --no-contact-cache
+```
 
 ## Requirements
 
@@ -150,6 +198,9 @@ cargo run --release --features ble -- \
 | `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `CORESPLITTER_LOG_JSON` | Enable JSON event logging |
 | `CORESPLITTER_RECORD_RADIO_RX` | Record all raw radio RX to database |
+| `CORESPLITTER_CACHE_CONTACTS` | Serve GET_CONTACTS from the cache (default: true; `--no-contact-cache` disables it) |
+| `CORESPLITTER_IN_FLIGHT_TIMEOUT` | Seconds to wait for the radio to answer one command before failing it with ERROR (default: 15) |
+| `CORESPLITTER_CLIENT_IDLE_TIMEOUT` | Seconds a client may go without sending anything before its connection is closed, 0 = never (default: 600) |
 | `CORESPLITTER_MESSAGES_RETENTION_DAYS` | Days to keep stored messages, 0 = forever (default: 0) |
 | `CORESPLITTER_RAW_RX_RETENTION_DAYS` | Days to keep raw_rx recordings, 0 = forever (default: 7) |
 | `CORESPLITTER_CLIENTS_RETENTION_DAYS` | Days a client may stay away before it is forgotten, 0 = never (default: 180) |
@@ -177,7 +228,8 @@ with an incremental vacuum.
   contact is only dropped if it was missing from the last full contact
   sync *and* the radio hasn't reported it for that many days. In that
   mode the maintenance pass also triggers a full sync, so that "last
-  sync" stays recent on long-running proxies.
+  sync" stays recent on long-running proxies. With `--no-contact-cache`
+  there are no rows to purge and the sync is not queued.
 
 ### Running as a systemd service
 
@@ -233,37 +285,58 @@ cleanly on `systemctl stop`.
 
 ### Integration tests
 
-Uses a fake radio (`tools/fake_radio.py`) and a real proxy deployed on
-ephemeral ports. Requires Python 3.12+ with `uv`.
+Uses a fake radio (`tools/fake_radio.py`) and a real proxy on ephemeral
+ports. Requires Python 3.12+ with `uv`:
 
 ```bash
-uv run tools/test_proxy.py
+cargo build                                    # the suite runs target/debug/coresplitter
+uv run pytest tools/test_proxy.py              # whole suite (~2 min)
+uv run pytest tools/test_proxy.py -k contacts  # one group, same session setup
 ```
 
-All tests run sequentially. Each cycle spawns a fresh proxy and fake radio,
-runs the tests, and cleans up.
-
-### Current tests (17 cases, 30 assertions, all PASS)
+The suite is pytest with `pytest-asyncio`. Tests and the session fixtures
+share one event loop, and an autouse session fixture starts the fake radio
+and the proxy once, so a `-k`-selected test still gets the full
+environment. Tests are therefore order-dependent by design: they share the
+radio's state, and a channel created in test 2 is expected in test 20.
+Anything that needs pristine cache state (the contact-cache tests) spawns
+its own proxy on its own data directory.
 
 | # | Test | Description |
 |---|------|-------------|
-| 1 | Multi-client concurrent | Two clients both receive SELF_INFO; one sends a message, the other receives the broadcast |
+| 1 | Multi-client concurrent | Two clients both receive SELF_INFO; one sends a channel message, the other receives the echo |
 | 2 | SET_CHANNEL + persistence | Creates a channel, verifies SQLite persistence after reconnection |
-| 3 | Injected channel msg via GET_MSG | Client waits for 0x83, polls with GET_MSG, gets CHANNEL_MSG_RECV (0x08) |
-| 4 | Injected contact msg via GET_MSG | Same as #3 for CONTACT_MSG_RECV (0x07) |
+| 3 | Injected channel msg via GET_MSG | Client waits for 0x83, polls with GET_MSG, gets CHANNEL_MSG_RECV |
+| 4 | Injected contact msg via GET_MSG | Same as #3 for CONTACT_MSG_RECV |
 | 5 | GET_MESSAGE polling | Client waits for 0x83, sends GET_MESSAGE, receives queued messages |
 | 6 | Multiple messages in order | FIFO polling: two consecutive messages have different content |
-| 7 | Long message (>133 chars) | Two clients: one sends long text, the other receives the intact broadcast |
-| 8 | Contact send (0x02) | Two clients: one sends SEND_MSG, the other receives the raw payload broadcast |
-| 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
-| 10 | REMOVE_CONTACT purges cache | Removes a contact; the next cached GET_CONTACTS no longer lists it |
-| 11 | Cached GET_CONTACTS mirrors radio | Cached CONTACT frames keep flags, path and lastmod; the `since` filter, START count and END lastmod follow the firmware |
-| 12 | ADD_UPDATE_CONTACT refreshes cache | After the radio accepts a contact update, the cached list shows its new name, path and lastmod |
-| 13 | Rejected send not echoed | SEND_CHAN_MSG to an unknown channel gets ERROR and no echo reaches the other client |
-| 14 | Missed messages replayed | A client that was offline gets the message it missed through GET_MSG on reconnect, and only once |
-| 15 | Own messages not replayed | A client that sends and disconnects does not get its own message back on reconnect |
-| 16 | Same app on two ports | Two copies of the same app on different ports each get the missed message |
-| 17 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
+| 7 | Long message (>133 chars) | One client sends long text, the other receives it intact |
+| 8 | Contact send (0x02) | One client sends SEND_MSG, the other receives the raw payload |
+| 9 | TCP reconnection | Kills the fake radio: clients are closed and the frontend stops listening; after the radio is back, GET_CHANNEL works again |
+| 10 | GET_MSG reply fans out | One client polls via GET_MSG, the other sees the same frame via broadcast |
+| 11 | Unsolicited pushes | 0x84/0x8C/0x8D/0x8E/0x8F/0x90 reach an idle client and do not terminate another client's in-flight request |
+| 12 | CHANNEL_DATA_RECV fan-out | A 0x1B group datagram polled by one client is fanned out to the rest |
+| 13 | Setter cache invalidation | SET_PATH_HASH_MODE (0x3D) invalidates the cached DEVICE_INFO |
+| 14 | CLI invalidation | RUN_CLI_COMMAND (0x42) clears SELF_INFO/DEVICE_INFO, since the CLI is a second setter path |
+| 15 | ACK routing | A late 0x82 ACK reaches its original sender even while another client's request is in flight |
+| 16 | Late reply is not misattributed | A reply arriving after the in-flight timeout is dropped instead of answering another client's request |
+| 17 | Client idle timeout | A silent client is reaped while a polling one on the same proxy outlives the sweep |
+| 18 | Out-of-range GET_CHANNEL | Only idx >= max_channels is answered locally with NOT_FOUND; an in-range one still reaches the cache |
+| 19 | Client request jumps the sync queue | With the radio slowed down, a client's non-cacheable request is answered immediately instead of waiting for the proxy's own sync to drain |
+| 20 | Cached contacts verbatim | Cached CONTACT frames keep flags, path and lastmod; `since`, the START count and the END lastmod follow the firmware |
+| 21 | Cache answers without the radio | With GET_CONTACTS parked at the radio, a client's ask is still answered from SQLite |
+| 22 | ADD_UPDATE_CONTACT refreshes cache | The cached list shows the radio's new name, path and lastmod |
+| 23 | REMOVE_CONTACT purges cache | The cached list no longer holds the removed contact |
+| 24 | Message layout per version | A v3 client gets 0x10/0x11 while a v1 client gets the same message as 0x07/0x08 |
+| 25 | Rejected send not echoed | SEND_CHAN_MSG to an unknown channel gets ERROR and no echo reaches the other client |
+| 26 | Missed messages replayed | A client that was offline gets what it missed through GET_MSG on reconnect, and only once |
+| 27 | Own messages not replayed | A client that sends and disconnects does not get its own message back |
+| 28 | Same app on two ports | Two copies of the same app on different frontend ports each get the missed message |
+| 29 | Cursor follows acknowledgement | A frame delivered after the client's last command stays replayable; an acknowledged one is not replayed |
+| 30 | Contacts are client-driven | No prefetch, no storage: the dump is the client's own request (`--no-contact-cache`) |
+| 31 | Factory reset invalidation | CMD_FACTORY_RESET (0x33) causes the next SELF_INFO to be re-read from the radio |
+| 32 | GET_CONTACT_BY_KEY | A 0x1E lookup is answered with 0x03 and reaches only its own client |
+| 33 | Resend echoed once | A retried channel message is echoed and stored once, checked live and through replay |
 
 ### Fake radio
 
@@ -277,6 +350,23 @@ uv run tools/fake_radio.py --port 5050 --inject
 # Serial PTY mode
 uv run tools/fake_radio.py --serial
 ```
+
+`--control-port` exposes a newline-delimited channel so tests never race the
+periodic injector:
+
+| Command | Effect |
+|---|---|
+| `hold <hexcode>` | park matching commands instead of replying |
+| `release` | dispatch parked commands in arrival order |
+| `delay <ms>` | slow every command response (avoid: it also starves the proxy's sync queue) |
+| `contacts reset` | restore the built-in contact list |
+| `push <hex>` | write a raw payload to every backend |
+| `queue <hex>` | enqueue a payload for the next GET_MSG |
+| `appver` / `stats` | negotiated `app_target_ver` / JSON counters and held count |
+
+`hold`/`release` is the tool for anything involving the in-flight slot: park
+the reply so the request stays in flight for exactly as long as the test
+needs, without slowing the rest of the traffic.
 
 ## Container
 
@@ -292,4 +382,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 30/30 PASS (17 cases) on TCP backend against fake radio
+- **Tests**: 35 integration tests (pytest) on TCP backend against fake radio, plus Rust unit tests
