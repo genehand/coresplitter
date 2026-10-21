@@ -1795,7 +1795,23 @@ impl Core {
             let _ = self.broadcast_tx.send(payload);
             return;
         }
-        // 6. Anything else is the late answer to a request that already timed
+        // 6. CURR_TIME needs its own, quieter line: a virtual companion
+        //    (openHop's frame server) writes one as an idle keepalive whenever
+        //    it has sent nothing for 15 s, which is the single frame such a
+        //    "radio" emits that no firmware ever would -- the radio writes
+        //    0x09 only as the reply to CMD_GET_DEVICE_TIME, and this proxy
+        //    never sends that. It cannot be a lost reply either: step 2 has
+        //    already consumed the frame an outstanding GET_TIME ghost was
+        //    owed. Warning on it would therefore fire during every 15 s of
+        //    radio silence and drown out the case the warning exists for, so
+        //    it is link noise between here and the companion, not a fault.
+        if resp_code == 0x09 {
+            tracing::debug!(
+                "ignoring unclaimed CURR_TIME (companion heartbeat, or a displaced GET_TIME reply)"
+            );
+            return;
+        }
+        // 7. Anything else is the late answer to a request that already timed
         //    out and whose ghost expired. Handing it to the clients would only
         //    make them take it as the reply to something else.
         tracing::warn!(
