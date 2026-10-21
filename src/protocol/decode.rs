@@ -135,6 +135,10 @@ pub fn decode_command_payload(code: u8, payload: &[u8]) -> Option<HashMap<String
             let target = hex::encode(&payload[2..34.min(payload.len())]);
             map.insert("target".into(), DecodedValue::String(target));
         }
+        // SET_PATH_HASH_MODE: [0x3D, 0x00, mode]
+        0x3D if payload.len() >= 3 => {
+            map.insert("mode".into(), DecodedValue::Integer(payload[2] as i64));
+        }
         0x38 if payload.len() > 1 => {
             let st = payload[1];
             let name = match st {

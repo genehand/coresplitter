@@ -30,6 +30,7 @@ pub enum CommandCode {
     SendRawData = 0x19,
     SendLogin = 0x1A,
     SendStatusReq = 0x1B,
+    HasConnection = 0x1C,
     SendLogout = 0x1D,
     GetContactByKey = 0x1E,
     GetChannel = 0x1F,
@@ -51,8 +52,16 @@ pub enum CommandCode {
     SetFloodScope = 0x36,
     SendControlData = 0x37,
     GetStats = 0x38,
-    RequestAdvert = 0x39,
-    HasConnection = 0x40,
+    SendAnonReq = 0x39,
+    SetAutoaddConfig = 0x3A,
+    GetAutoaddConfig = 0x3B,
+    GetAllowedRepeatFreq = 0x3C,
+    SetPathHashMode = 0x3D,
+    SendChannelData = 0x3E,
+    SetDefaultFloodScope = 0x3F,
+    GetDefaultFloodScope = 0x40,
+    SendRawPacket = 0x41,
+    RunCliCommand = 0x42,
 }
 
 impl CommandCode {
@@ -85,6 +94,7 @@ impl CommandCode {
             0x19 => Some(Self::SendRawData),
             0x1A => Some(Self::SendLogin),
             0x1B => Some(Self::SendStatusReq),
+            0x1C => Some(Self::HasConnection),
             0x1D => Some(Self::SendLogout),
             0x1E => Some(Self::GetContactByKey),
             0x1F => Some(Self::GetChannel),
@@ -106,8 +116,16 @@ impl CommandCode {
             0x36 => Some(Self::SetFloodScope),
             0x37 => Some(Self::SendControlData),
             0x38 => Some(Self::GetStats),
-            0x39 => Some(Self::RequestAdvert),
-            0x40 => Some(Self::HasConnection),
+            0x39 => Some(Self::SendAnonReq),
+            0x3A => Some(Self::SetAutoaddConfig),
+            0x3B => Some(Self::GetAutoaddConfig),
+            0x3C => Some(Self::GetAllowedRepeatFreq),
+            0x3D => Some(Self::SetPathHashMode),
+            0x3E => Some(Self::SendChannelData),
+            0x3F => Some(Self::SetDefaultFloodScope),
+            0x40 => Some(Self::GetDefaultFloodScope),
+            0x41 => Some(Self::SendRawPacket),
+            0x42 => Some(Self::RunCliCommand),
             _ => None,
         }
     }
@@ -143,6 +161,7 @@ impl fmt::Display for CommandCode {
             Self::SendRawData => "CMD_SEND_RAW_DATA",
             Self::SendLogin => "CMD_SEND_LOGIN",
             Self::SendStatusReq => "CMD_SEND_STATUS_REQ",
+            Self::HasConnection => "CMD_HAS_CONNECTION",
             Self::SendLogout => "CMD_SEND_LOGOUT",
             Self::GetContactByKey => "CMD_GET_CONTACT_BY_KEY",
             Self::GetChannel => "CMD_GET_CHANNEL",
@@ -164,8 +183,16 @@ impl fmt::Display for CommandCode {
             Self::SetFloodScope => "CMD_SET_FLOOD_SCOPE",
             Self::SendControlData => "CMD_SEND_CONTROL_DATA",
             Self::GetStats => "CMD_GET_STATS",
-            Self::RequestAdvert => "CMD_REQUEST_ADVERT",
-            Self::HasConnection => "CMD_HAS_CONNECTION",
+            Self::SendAnonReq => "CMD_SEND_ANON_REQ",
+            Self::SetAutoaddConfig => "CMD_SET_AUTOADD_CONFIG",
+            Self::GetAutoaddConfig => "CMD_GET_AUTOADD_CONFIG",
+            Self::GetAllowedRepeatFreq => "CMD_GET_ALLOWED_REPEAT_FREQ",
+            Self::SetPathHashMode => "CMD_SET_PATH_HASH_MODE",
+            Self::SendChannelData => "CMD_SEND_CHANNEL_DATA",
+            Self::SetDefaultFloodScope => "CMD_SET_DEFAULT_FLOOD_SCOPE",
+            Self::GetDefaultFloodScope => "CMD_GET_DEFAULT_FLOOD_SCOPE",
+            Self::SendRawPacket => "CMD_SEND_RAW_PACKET",
+            Self::RunCliCommand => "CMD_RUN_CLI_COMMAND",
         };
         write!(f, "{name}")
     }
@@ -204,8 +231,6 @@ pub enum ResponseCode {
     ChannelDataRecv = 0x1B,
     DefaultFloodScope = 0x1C,
     CliReply = 0x1D,
-    BinaryReq = 0x32,
-    PathDiscovery = 0x34,
     Advertisement = 0x80,
     PathUpdate = 0x81,
     Ack = 0x82,
@@ -258,8 +283,6 @@ impl ResponseCode {
             0x1B => Some(Self::ChannelDataRecv),
             0x1C => Some(Self::DefaultFloodScope),
             0x1D => Some(Self::CliReply),
-            0x32 => Some(Self::BinaryReq),
-            0x34 => Some(Self::PathDiscovery),
             0x80 => Some(Self::Advertisement),
             0x81 => Some(Self::PathUpdate),
             0x82 => Some(Self::Ack),
@@ -315,8 +338,6 @@ impl fmt::Display for ResponseCode {
             Self::ChannelDataRecv => "CHANNEL_DATA_RECV",
             Self::DefaultFloodScope => "DEFAULT_FLOOD_SCOPE",
             Self::CliReply => "CLI_REPLY",
-            Self::BinaryReq => "BINARY_REQ",
-            Self::PathDiscovery => "PATH_DISCOVERY",
             Self::Advertisement => "ADVERTISEMENT",
             Self::PathUpdate => "PATH_UPDATE",
             Self::Ack => "ACK",
@@ -336,5 +357,31 @@ impl fmt::Display for ResponseCode {
             Self::ContactsFull => "CONTACTS_FULL",
         };
         write!(f, "{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_firmware_command_is_known() {
+        // CMD_* in examples/companion_radio/MyMesh.cpp: 0x2C..0x31 and
+        // 0x35 are unassigned.
+        let codes = (0x01..=0x2B).chain(0x32..=0x34).chain(0x36..=0x42);
+        for b in codes {
+            let cmd = CommandCode::from_byte(b).unwrap_or_else(|| panic!("0x{b:02x} unknown"));
+            assert_eq!(cmd as u8, b);
+        }
+        assert_eq!(CommandCode::from_byte(0x35), None);
+    }
+
+    #[test]
+    fn every_firmware_response_is_known() {
+        for b in (0x00..=0x1D).chain(0x80..=0x90) {
+            let resp = ResponseCode::from_byte(b).unwrap_or_else(|| panic!("0x{b:02x} unknown"));
+            assert_eq!(resp as u8, b);
+        }
+        assert_eq!(ResponseCode::from_byte(0x32), None);
     }
 }
