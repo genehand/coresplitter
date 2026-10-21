@@ -398,6 +398,7 @@ impl Core {
                 messages = stats.messages,
                 raw_rx = stats.raw_rx,
                 contacts = stats.contacts,
+                clients = stats.clients,
                 "database maintenance done"
             ),
             Err(e) => tracing::warn!(error = %e, "database maintenance failed"),

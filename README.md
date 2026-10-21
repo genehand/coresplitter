@@ -148,6 +148,7 @@ cargo run --release --features ble -- \
 | `CORESPLITTER_RECORD_RADIO_RX` | Record all raw radio RX to database |
 | `CORESPLITTER_MESSAGES_RETENTION_DAYS` | Days to keep stored messages, 0 = forever (default: 0) |
 | `CORESPLITTER_RAW_RX_RETENTION_DAYS` | Days to keep raw_rx recordings, 0 = forever (default: 7) |
+| `CORESPLITTER_CLIENTS_RETENTION_DAYS` | Days a client may stay away before it is forgotten, 0 = never (default: 180) |
 | `CORESPLITTER_NEW_CLIENT_BACKLOG` | Messages replayed to a never-seen client: 0 = none, N = last N messages, Nh / Nd = last N hours / days (default: 0) |
 | `CORESPLITTER_CONTACTS_RETENTION_DAYS` | Days a contact may be missing from the radio before it leaves the cache, 0 = never (default: 0) |
 
@@ -162,6 +163,10 @@ with an incremental vacuum.
   can be arbitrarily wrong.
   A client offline for longer than the retention misses what was
   purged meanwhile.
+- **Clients** (the identities used to replay missed messages) are
+  forgotten after 180 days without connecting. One that comes back
+  later is treated as new and gets `CORESPLITTER_NEW_CLIENT_BACKLOG`
+  instead of everything it missed.
 - **Contacts** are kept by default even when the radio no longer
   reports them: the cache is a safeguard against a node losing its
   contacts (firmware reflash, factory reset). With a retention set, a

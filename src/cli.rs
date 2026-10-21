@@ -98,6 +98,15 @@ pub struct Cli {
     )]
     pub contacts_retention_days: u32,
 
+    /// Days a client may stay away before it is forgotten; if it comes
+    /// back it is treated as new (0 = never)
+    #[arg(
+        long,
+        default_value_t = 180,
+        env = "CORESPLITTER_CLIENTS_RETENTION_DAYS"
+    )]
+    pub clients_retention_days: u32,
+
     /// Messages replayed to a client seen for the first time: 0 = none,
     /// N = the last N messages, Nh / Nd = those of the last N hours / days
     #[arg(long, default_value = "0", env = "CORESPLITTER_NEW_CLIENT_BACKLOG")]
@@ -140,6 +149,7 @@ impl Cli {
                 messages_days: self.messages_retention_days,
                 raw_rx_days: self.raw_rx_retention_days,
                 contacts_days: self.contacts_retention_days,
+                clients_days: self.clients_retention_days,
             },
             new_client_backlog: self.new_client_backlog,
         }

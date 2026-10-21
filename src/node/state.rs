@@ -473,6 +473,16 @@ impl NodeState {
                 .rows_affected();
         }
 
+        // A purged client that comes back is treated as new
+        // (CORESPLITTER_NEW_CLIENT_BACKLOG) instead of getting what it missed.
+        if retention.clients_days > 0 {
+            stats.clients = sqlx::query("DELETE FROM clients WHERE last_connected_at < ?1")
+                .bind(cutoff(retention.clients_days))
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        }
+
         sqlx::query("PRAGMA incremental_vacuum")
             .execute(&self.pool)
             .await?;
@@ -549,6 +559,7 @@ pub struct Retention {
     pub messages_days: u32,
     pub raw_rx_days: u32,
     pub contacts_days: u32,
+    pub clients_days: u32,
 }
 
 #[derive(Debug, Default)]
@@ -556,6 +567,7 @@ pub struct PurgeStats {
     pub messages: u64,
     pub raw_rx: u64,
     pub contacts: u64,
+    pub clients: u64,
 }
 
 #[cfg(test)]
@@ -651,6 +663,7 @@ mod tests {
             messages_days: 30,
             raw_rx_days: 7,
             contacts_days: 0,
+            clients_days: 0,
         };
         let stats = state.maintain(&retention).await.unwrap();
         assert_eq!((stats.messages, stats.raw_rx), (1, 1));
@@ -672,6 +685,7 @@ mod tests {
             messages_days: 0,
             raw_rx_days: 0,
             contacts_days: 30,
+            clients_days: 0,
         };
         assert_eq!(state.maintain(&retention).await.unwrap().contacts, 0);
         assert_eq!(contact_keys(&state).await, [1]);
@@ -696,6 +710,7 @@ mod tests {
             messages_days: 0,
             raw_rx_days: 0,
             contacts_days: 30,
+            clients_days: 0,
         };
         assert_eq!(state.maintain(&retention).await.unwrap().contacts, 1);
         assert_eq!(contact_keys(&state).await, [2, 3]);
@@ -791,5 +806,30 @@ mod tests {
         state.advance_client_cursor(5000, "app", 7).await.unwrap();
         assert_eq!(state.client_cursor(5000, "app").await.unwrap(), Some(10));
         assert_eq!(state.client_cursor(5001, "app").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn idle_clients_are_forgotten() {
+        let state = open_temp("clients").await;
+        state.advance_client_cursor(5000, "old", 1).await.unwrap();
+        state
+            .advance_client_cursor(5000, "recent", 1)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE clients SET last_connected_at = ?1 WHERE app_name = 'old'")
+            .bind(chrono::Utc::now().timestamp() - 200 * DAY)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let retention = Retention {
+            messages_days: 0,
+            raw_rx_days: 0,
+            contacts_days: 0,
+            clients_days: 180,
+        };
+        assert_eq!(state.maintain(&retention).await.unwrap().clients, 1);
+        assert_eq!(state.client_cursor(5000, "old").await.unwrap(), None);
+        assert_eq!(state.client_cursor(5000, "recent").await.unwrap(), Some(1));
     }
 }
