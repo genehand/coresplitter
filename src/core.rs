@@ -228,6 +228,11 @@ pub struct CoreConfig {
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
     pub record_radio_rx: bool,
+    /// Whether a GET_CONTACTS may be answered from the SQLite contact cache.
+    /// Off (`--no-contact-cache`) forwards every ask to the radio instead, so
+    /// the client always sees the live reply and the proxy keeps no second
+    /// watermark. See `sync_from_radio` for what else switches off.
+    pub cache_contacts: bool,
     pub retention: Retention,
     pub new_client_backlog: Backlog,
 }
@@ -313,7 +318,10 @@ impl Core {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        tracing::info!("starting coresplitter (MeshCore client multiplexer + cache)");
+        tracing::info!(
+            cache_contacts = self.config.cache_contacts,
+            "starting coresplitter (MeshCore client multiplexer + cache)"
+        );
 
         if let Err(e) = self.connect_backend().await {
             tracing::warn!(error = %e, "initial radio connection failed, will retry");
@@ -425,7 +433,7 @@ impl Core {
         // the proxy runs for weeks without reconnecting.
         let full_sync_pending = self.in_flight.as_ref().is_some_and(|f| f.payload == [0x04])
             || self.pending_queue.iter().any(|q| q.payload == [0x04]);
-        if retention.contacts_days > 0 && !full_sync_pending {
+        if self.config.cache_contacts && retention.contacts_days > 0 && !full_sync_pending {
             self.pending_queue.push_back(Queued {
                 client_id: None,
                 payload: vec![0x04],
@@ -699,10 +707,18 @@ impl Core {
         // Enqueue through the normal serialization path so sync responses
         // can never interleave with in-flight client requests.
         // client_id=None: responses are cached but not forwarded to any client.
-        self.pending_queue.push_back(Queued {
-            client_id: None,
-            payload: vec![0x04],
-        });
+        //
+        // Without the cache there is nothing to prefetch. The request is the
+        // client's to make: it carries its own `since` watermark and the radio
+        // filters the reply by it, so an unattended whole-book dump at startup
+        // would be paid for and thrown away -- minutes of radio time on a
+        // repeater with hundreds of contacts.
+        if self.config.cache_contacts {
+            self.pending_queue.push_back(Queued {
+                client_id: None,
+                payload: vec![0x04],
+            });
+        }
         for idx in 0..self.max_channels {
             self.pending_queue.push_back(Queued {
                 client_id: None,
@@ -817,7 +833,7 @@ impl Core {
                     return true;
                 }
             }
-            0x04 => {
+            0x04 if self.config.cache_contacts => {
                 if let Ok(contacts) = self.state.get_contacts().await
                     && !contacts.is_empty()
                 {
@@ -877,7 +893,7 @@ impl Core {
         match cmd_code {
             // REMOVE_CONTACT: drop it from the cache too, otherwise the
             // next cached GET_CONTACTS would resurrect it.
-            0x0F if payload.len() >= 33 => {
+            0x0F if self.config.cache_contacts && payload.len() >= 33 => {
                 if let Err(e) = self.state.delete_contact(&payload[1..33]).await {
                     tracing::warn!(error = %e, "failed to delete cached contact");
                 }
@@ -923,31 +939,36 @@ impl Core {
             self.notify_missed(&cid);
         }
         // Contact table changes: re-read what the radio now holds so the
-        // cache serves the same frame (path, flags, lastmod) it would.
-        match payload[0] {
-            // A complete, unfiltered GET_CONTACTS: every contact the radio
-            // holds was just re-cached with seen_at >= the dispatch time.
-            0x04 if payload.len() == 1 => {
-                if let Err(e) = self.state.set_contacts_synced_at(done.sent_unix).await {
-                    tracing::warn!(error = %e, "failed to record contacts sync time");
+        // cache serves the same frame (path, flags, lastmod) it would. With
+        // the cache off there is no table to keep fresh, so none of these
+        // internal reads are queued.
+        if self.config.cache_contacts {
+            match payload[0] {
+                // A complete, unfiltered GET_CONTACTS: every contact the radio
+                // holds was just re-cached with seen_at >= the dispatch time.
+                0x04 if payload.len() == 1 => {
+                    if let Err(e) = self.state.set_contacts_synced_at(done.sent_unix).await {
+                        tracing::warn!(error = %e, "failed to record contacts sync time");
+                    }
                 }
+                // ADD_UPDATE_CONTACT, RESET_PATH: [cmd, pubkey(32), ...]
+                0x09 | 0x0D if payload.len() >= 33 => self.queue_contact_refresh(&payload[1..33]),
+                // IMPORT_CONTACT takes an advert blob; the key isn't at a fixed
+                // offset, so re-read the whole list.
+                0x12 => self.pending_queue.push_back(Queued {
+                    client_id: None,
+                    payload: vec![0x04],
+                }),
+                _ => {}
             }
-            // ADD_UPDATE_CONTACT, RESET_PATH: [cmd, pubkey(32), ...]
-            0x09 | 0x0D if payload.len() >= 33 => self.queue_contact_refresh(&payload[1..33]),
-            // IMPORT_CONTACT takes an advert blob; the key isn't at a fixed
-            // offset, so re-read the whole list.
-            0x12 => self.pending_queue.push_back(Queued {
-                client_id: None,
-                payload: vec![0x04],
-            }),
-            // SET_ADVERT_NAME: [cmd, name]; the firmware keeps 31 bytes.
-            // Channel echoes carry the name, so keep it current.
-            0x08 => {
-                let name = &payload[1..payload.len().min(32)];
-                let name = String::from_utf8_lossy(name);
-                self.radio_name = Some(name.trim_end_matches('\0').to_string());
-            }
-            _ => {}
+        }
+        // SET_ADVERT_NAME: [cmd, name]; the firmware keeps 31 bytes. Channel
+        // echoes carry the name, so keep it current -- outside the contact
+        // gate, since the echo needs it regardless of the cache.
+        if payload[0] == 0x08 {
+            let name = &payload[1..payload.len().min(32)];
+            let name = String::from_utf8_lossy(name);
+            self.radio_name = Some(name.trim_end_matches('\0').to_string());
         }
 
         if let Some(cid) = client_id {
@@ -1401,7 +1422,8 @@ impl Core {
         if is_push_event(resp_code) {
             // ADVERT / PATH_UPDATE: [code, pubkey(32)] for a contact the
             // radio just updated (last_advert, path). Refresh our copy.
-            if matches!(resp_code, 0x80 | 0x81) && payload.len() >= 33 {
+            if self.config.cache_contacts && matches!(resp_code, 0x80 | 0x81) && payload.len() >= 33
+            {
                 self.queue_contact_refresh(&payload[1..33]);
                 if self.in_flight.is_none() {
                     self.advance_queue().await;
@@ -1491,7 +1513,7 @@ impl Core {
 
     async fn cache_response(&mut self, code: u8, payload: &[u8]) {
         match code {
-            0x03 if payload.len() >= CONTACT_FRAME_LEN => {
+            0x03 if self.config.cache_contacts && payload.len() >= CONTACT_FRAME_LEN => {
                 let pk = payload[1..33].to_vec();
                 let contact_type = payload[33] as i64;
                 let name_field = &payload[100..132];
