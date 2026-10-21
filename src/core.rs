@@ -1130,7 +1130,7 @@ impl Core {
                     }
                 }
             }
-            0x10 if payload.len() >= 13 => {
+            0x10 if payload.len() >= 16 => {
                 let txt_type = payload[11];
                 let from_key = Some(payload[4..10].to_vec());
                 let ts = u32::from_le_bytes(payload[12..16].try_into().unwrap_or([0; 4])) as i64;
