@@ -163,6 +163,19 @@ struct Session {
     /// before the radio is asked. While non-empty its cursor advances
     /// only as these are delivered.
     pending: VecDeque<i64>,
+    /// Highest message id this session saw live, or was caught up to when it
+    /// identified itself. Written into the socket; whether the peer read it is
+    /// a separate question, see `confirmed`.
+    live_high: i64,
+    /// `live_high` as of this client's most recent command. TCP delivers in
+    /// order, so a command proves every frame written before it arrived, and
+    /// says nothing about frames written after it. That is the only delivery
+    /// evidence the proxy ever gets, so this -- and not `live_high` -- is what
+    /// may be persisted while the client is connected.
+    confirmed: i64,
+    /// Highest value this session has written, so a tick with nothing new
+    /// costs no query.
+    flushed: i64,
 }
 
 #[derive(Debug)]
@@ -467,6 +480,7 @@ impl Core {
                 _ = timeout_tick.tick() => {
                     self.check_in_flight_timeout().await;
                     self.expire_ghosts();
+                    self.flush_client_cursors().await;
                 }
                 _ = maintenance_tick.tick() => {
                     self.run_maintenance().await;
@@ -834,6 +848,11 @@ impl Core {
         let cmd_code = cmd.payload[0];
         self.log_event("->", cmd_code, &cmd.payload);
 
+        // The client just spoke, so everything written to it before this
+        // command arrived was delivered (TCP is in order). Anything newer is
+        // still replayable.
+        self.confirm_delivery(&cmd.client_id);
+
         if cmd_code == 0x01 {
             self.register_session(&cmd).await;
         }
@@ -1162,6 +1181,9 @@ impl Core {
                 port,
                 app_name,
                 pending,
+                live_high: cursor,
+                confirmed: cursor,
+                flushed: cursor,
             },
         );
     }
@@ -1196,21 +1218,32 @@ impl Core {
                 continue;
             };
             self.send_to_client(client_id, frame);
-            let _ = self.state.advance_client_cursor(port, &app_name, id).await;
+            // A replayed frame is credited as it is handed over: it came out
+            // of the log, not off the wire, and it is already behind the
+            // client's own cursor.
+            if let Err(e) = self.state.advance_client_cursor(port, &app_name, id).await {
+                tracing::warn!(error = %e, "failed to advance client cursor");
+            }
+            if let Some(session) = self.sessions.get_mut(client_id) {
+                session.live_high = id;
+                session.confirmed = id;
+                session.flushed = session.flushed.max(id);
+            }
             served = true;
             break;
         }
-        // Caught up: from now on the cursor follows live traffic.
+        // Caught up: from now on the cursor follows live traffic. Only the
+        // watermark is recorded here, not persisted -- the client has not
+        // acknowledged any of it yet (see `flush_client_cursors`).
         if self
             .sessions
             .get(client_id)
             .is_some_and(|s| s.pending.is_empty())
-            && let Ok(head) = self.state.message_head().await
         {
-            let _ = self
-                .state
-                .advance_client_cursor(port, &app_name, head)
-                .await;
+            let head = self.state.message_head().await.unwrap_or(0);
+            if let Some(session) = self.sessions.get_mut(client_id) {
+                session.live_high = session.live_high.max(head);
+            }
         }
         served
     }
@@ -1225,24 +1258,87 @@ impl Core {
         Ok(())
     }
 
+    /// Note that every caught-up, still-connected client has seen `id`.
+    ///
+    /// Only in memory: writing it here would claim the frame reached the peer
+    /// when all that happened is that it was written into the socket. A client
+    /// that has already gone is skipped -- crediting it would move the shared
+    /// cursor past frames stored after it left, which nobody following it on
+    /// that identity would ever be told about.
     async fn follow_head(&mut self, id: i64) {
-        let mut identities: Vec<(u16, String)> = {
+        let channels = self.client_channels.lock().unwrap();
+        for (cid, session) in self.sessions.iter_mut() {
+            if session.pending.is_empty() && channels.contains_key(cid) {
+                session.live_high = session.live_high.max(id);
+            }
+        }
+    }
+
+    /// Record what a client has provably received, from the fact that it just
+    /// spoke.
+    fn confirm_delivery(&mut self, client_id: &ClientId) {
+        if let Some(session) = self.sessions.get_mut(client_id)
+            && session.pending.is_empty()
+        {
+            session.confirmed = session.live_high;
+        }
+    }
+
+    /// Persist each client's cursor, once a second.
+    ///
+    /// `client_is_alive` is not the same as "the app is still reading". A
+    /// laptop moving from ethernet to wifi leaves a half-open socket behind: no
+    /// FIN, no RST, writes still succeeding into the kernel buffer, and the
+    /// frontend keeps the client for the whole idle timeout. Persisting
+    /// `live_high` through that window would credit frames that never arrived,
+    /// and the reconnect -- a new client id on the same identity -- would seed
+    /// itself past them.
+    ///
+    /// So a live client is persisted only up to `confirmed`, which is within a
+    /// second of what it actually read. A client that is gone is written the
+    /// same way: a reaped half-open socket looks exactly like a clean close at
+    /// this layer, and a duplicate frame on the next connect is the acceptable
+    /// side of that ambiguity -- a skipped frame is not.
+    async fn flush_client_cursors(&mut self) {
+        let cursors: Vec<(ClientId, u16, String, i64, bool)> = {
             let channels = self.client_channels.lock().unwrap();
-            self.sessions.retain(|cid, _| channels.contains_key(cid));
-            self.protocol_versions
-                .retain(|cid, _| channels.contains_key(cid));
             self.sessions
-                .values()
-                .filter(|s| s.pending.is_empty())
-                .map(|s| (s.port, s.app_name.clone()))
+                .iter()
+                .map(|(cid, s)| {
+                    (
+                        *cid,
+                        s.port,
+                        s.app_name.clone(),
+                        s.confirmed,
+                        channels.contains_key(cid),
+                    )
+                })
                 .collect()
         };
-        identities.sort();
-        identities.dedup();
-        for (port, app_name) in identities {
-            if let Err(e) = self.state.advance_client_cursor(port, &app_name, id).await {
-                tracing::warn!(error = %e, "failed to advance client cursor");
+        for (cid, port, app_name, value, alive) in cursors {
+            self.store_client_cursor(&cid, port, &app_name, value).await;
+            if !alive {
+                self.sessions.remove(&cid);
+                self.protocol_versions.remove(&cid);
             }
+        }
+    }
+
+    /// Write a client cursor unless this session already wrote one that far.
+    async fn store_client_cursor(&mut self, cid: &ClientId, port: u16, app_name: &str, value: i64) {
+        if self.sessions.get(cid).is_some_and(|s| s.flushed >= value) {
+            return;
+        }
+        if let Err(e) = self
+            .state
+            .advance_client_cursor(port, app_name, value)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to persist client cursor");
+            return;
+        }
+        if let Some(session) = self.sessions.get_mut(cid) {
+            session.flushed = session.flushed.max(value);
         }
     }
 
