@@ -450,16 +450,19 @@ async def test_long_message(proxy_port):
         p = await c2.recv(2)
         if p is None or len(p) == 0:
             continue
-        if p[0] == 0x08:
-            txt_rx = p[8:].decode("utf-8", errors="replace") if len(p) > 8 else ""
-            if "Lorem" in txt_rx or len(txt_rx) > 100:
-                received = True
-                break
+        if p[0] == 0x08 and b"Lorem" in p:
+            txt_rx = p[8:].decode("utf-8", errors="replace")
+            received = True
+            break
 
-    if received:
-        ok(f"c2 receives CHANNEL_MSG_RECV (0x08) with long text ({len(txt_rx)} chars)")
-    else:
+    # The rest of the mesh gets "<node name>: <text>", cut at 160 bytes.
+    expected = ("FakeRadio: " + long_text)[:160]
+    if not received:
         fail("c2 did not receive long message broadcast in 6s")
+    elif txt_rx == expected:
+        ok(f"c2 receives the channel echo as sent on air ({len(txt_rx)} chars)")
+    else:
+        fail(f"c2 got {txt_rx!r}, expected {expected!r}")
 
     await c1.close()
     await c2.close()

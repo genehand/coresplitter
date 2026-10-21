@@ -35,6 +35,8 @@ const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 /// the last DEVICE_QUERY it got, so it must not follow each client's: v3
 /// keeps the SNR, and older clients get the frame converted back.
 const RADIO_PROTOCOL_VERSION: u8 = 3;
+/// Longest text the firmware puts in a message (MAX_TEXT_LEN).
+const MAX_TEXT_LEN: usize = 160;
 
 /// The firmware reserves every code with the high bit set (PUSH_CODE_*,
 /// 0x80..) for spontaneous push events: ADVERT, MSG_WAITING, LOGIN_*,
@@ -43,6 +45,18 @@ const RADIO_PROTOCOL_VERSION: u8 = 3;
 /// (0x82), which has its own routing via `pending_acks`.
 fn is_push_event(code: u8) -> bool {
     code >= 0x80
+}
+
+/// A channel message as the rest of the mesh receives it: the firmware
+/// sends "<node name>: <text>", cut at MAX_TEXT_LEN bytes
+/// (BaseChatMesh::sendGroupMessage).
+fn channel_text_on_air(node_name: Option<&str>, text: &[u8]) -> Vec<u8> {
+    let mut out = node_name
+        .map(|name| format!("{name}: ").into_bytes())
+        .unwrap_or_default();
+    let room = MAX_TEXT_LEN.saturating_sub(out.len());
+    out.extend_from_slice(&text[..text.len().min(room)]);
+    out
 }
 
 /// From v3 on, CONTACT_MSG_RECV and CHANNEL_MSG_RECV (0x07/0x08) become
@@ -926,6 +940,13 @@ impl Core {
                 client_id: None,
                 payload: vec![0x04],
             }),
+            // SET_ADVERT_NAME: [cmd, name]; the firmware keeps 31 bytes.
+            // Channel echoes carry the name, so keep it current.
+            0x08 => {
+                let name = &payload[1..payload.len().min(32)];
+                let name = String::from_utf8_lossy(name);
+                self.radio_name = Some(name.trim_end_matches('\0').to_string());
+            }
             _ => {}
         }
 
@@ -1179,15 +1200,16 @@ impl Core {
         let from_key = &pk[..6];
         let channel = payload[2] as i64;
         let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
-        let text = String::from_utf8_lossy(&payload[7..]).to_string();
+        let on_air = channel_text_on_air(self.radio_name.as_deref(), &payload[7..]);
+        let text = String::from_utf8_lossy(&on_air).to_string();
 
-        let mut fake = Vec::with_capacity(8 + text.len());
+        let mut fake = Vec::with_capacity(8 + on_air.len());
         fake.push(0x08);
         fake.push(payload[2]); // channel
         fake.push(0); // path_len
         fake.push(0); // txt_type = text
         fake.extend_from_slice(&payload[3..7]); // timestamp
-        fake.extend_from_slice(text.as_bytes());
+        fake.extend_from_slice(&on_air);
         self.broadcast_to_others(Some(sender), &fake);
 
         let _ = self
@@ -1868,6 +1890,17 @@ mod tests {
         let unknown = awaiting_for(&[0x7E]);
         assert!(unknown.classify(0x2A).0);
         assert!(!unknown.classify(0x83).0);
+    }
+
+    #[test]
+    fn channel_echo_carries_node_name() {
+        assert_eq!(channel_text_on_air(Some("Node"), b"hola"), b"Node: hola");
+        assert_eq!(channel_text_on_air(None, b"hola"), b"hola");
+        // Cut like the firmware: prefix plus text never exceed MAX_TEXT_LEN.
+        let long = [b'x'; 200];
+        let out = channel_text_on_air(Some("Node"), &long);
+        assert_eq!(out.len(), MAX_TEXT_LEN);
+        assert!(out.starts_with(b"Node: x"));
     }
 
     #[test]
