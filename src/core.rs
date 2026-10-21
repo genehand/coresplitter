@@ -339,6 +339,15 @@ pub struct Core {
     // sends (0x03) never produce an ACK, so without eviction those
     // entries would accumulate forever.
     pending_acks: HashMap<[u8; 4], (ClientId, Instant)>,
+    // Payloads (`payload[1..]`) of the channel sends already echoed, so a
+    // resend of the same message is echoed -- and logged -- only once. A
+    // resend is not a new message: the client reuses the timestamp, which is
+    // what makes the two commands the *same* on-air packet, and the firmware
+    // drops the duplicate in its `wasSeen` table before any companion sees it.
+    // Bounded and byte-compared rather than hashed: the payload carries the
+    // sender's timestamp, so an identical payload can only be a retransmission
+    // (the size matches the firmware's own dup table, `MAX_PACKET_HASHES`).
+    recent_channel_echoes: VecDeque<Vec<u8>>,
     // Message-history replay state, one entry per client that has polled on a
     // history listener. The entry outlives a client's catch-up (so a second
     // client on the same single-client listener can be spotted) and is
@@ -406,6 +415,7 @@ impl Core {
             contacts: None,
             ghosts: VecDeque::new(),
             pending_acks: HashMap::new(),
+            recent_channel_echoes: VecDeque::new(),
             history_sync: HashMap::new(),
             last_prune: Instant::now(),
         })
@@ -1489,7 +1499,29 @@ impl Core {
     /// pinned to APP_TARGET_VER: the radio only ever emits V3 and clients are
     /// told firmware 13, so an echo in any other generation would be a frame
     /// the radio itself would no longer produce.
+    ///
+    /// Emitted once per distinct send, so a client retrying a message does not
+    /// give every other client a second copy of it.
     async fn synthesize_channel_echo(&mut self, sender: &ClientId, payload: &[u8]) {
+        // A resend is the same message and the same on-air packet, not a new
+        // one: the client reuses the timestamp, the firmware mixes it into the
+        // payload hash on purpose (`BaseChatMesh::sendGroupMessage`), and its
+        // `wasSeen` table drops the copy before any companion interface is
+        // reached. A second echo would be a frame no radio would ever have
+        // emitted -- and one logged row per attempt means every later replay
+        // hands the message to the next client twice.
+        let identity = &payload[1..];
+        if self
+            .recent_channel_echoes
+            .iter()
+            .any(|p| p.as_slice() == identity)
+        {
+            tracing::debug!(
+                client = %sender,
+                "suppressing the echo of a resent channel message"
+            );
+            return;
+        }
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG");
             return;
@@ -1540,6 +1572,15 @@ impl Core {
         {
             self.credit_history_receipts(id, Some(sender));
         }
+
+        // Recorded even when nothing was logged: with `log_messages` off (no
+        // listener replays) the echo is still broadcast, and the duplicate is
+        // just as visible live as it would be from a replay.
+        const MAX_RECENT_ECHOES: usize = 160;
+        if self.recent_channel_echoes.len() == MAX_RECENT_ECHOES {
+            self.recent_channel_echoes.pop_front();
+        }
+        self.recent_channel_echoes.push_back(identity.to_vec());
     }
 
     /// Called on every timeout tick. Fails the request in flight once it has

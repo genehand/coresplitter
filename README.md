@@ -124,6 +124,11 @@ coresplitter \
   (~0.35 ms of each poll), and with no named listener no cursor could ever
   read the row back. `--tcp-frontend-port`-only deployments therefore pay
   nothing for history, and the log starts when you add a `--listen`.
+- A retried send is logged once. The client resends with the *same*
+  timestamp, which makes the command the same on-air packet — the mesh
+  itself drops the duplicate before it reaches any companion — so the
+  proxy echoes and logs the synthesized frame once per distinct send
+  rather than once per attempt.
 - Logged messages older than `--message-history-hours` are pruned about
   once a minute, measured on the proxy's clock rather than the sender's
   (LoRa timestamps come from the sender's RTC and can be skewed or
@@ -320,4 +325,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 30 integration tests (pytest) on TCP backend against fake radio, 9 Rust unit tests
+- **Tests**: Integration tests (pytest) on TCP backend against fake radio, Rust unit tests

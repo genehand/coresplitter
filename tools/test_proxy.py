@@ -2373,6 +2373,84 @@ async def test_live_cursor_is_persisted_while_connected(history_port, control_po
         fail(f"a frame delivered after the last acknowledgement was skipped ({len(frames)})")
 
 
+async def test_resend_echoes_once(history_port, proxy_port):
+    """Test 34: a resent channel message is echoed -- and logged -- once.
+
+    A resend is not a new message: the client reuses the timestamp, which is
+    what the firmware mixes into the payload hash on purpose, and the radio's
+    `wasSeen` table drops the copy before any companion interface is reached.
+    One echo per attempt therefore invents a frame no radio would have emitted,
+    and one logged row per attempt means a later replay hands the message to
+    the next client twice.
+
+    Asserted from both sides, because neither alone shows the bug: a second,
+    idle client watching the broadcast sees the live duplicate, and a fresh
+    connection replaying the log sees the logged one.
+    """
+    log.info("--- Test 34: a resent channel message is echoed once ---")
+    text = "Resend dedupe probe"
+    needle = text.encode()
+    # Fixed rather than "now", so the two sends below are byte-identical, which
+    # is exactly what a client retransmits (`channel_chat_screen.dart`'s
+    # transmit() passes the message's own timestamp again).
+    ts = int(time.time()) - 2
+
+    # Start the shared cursor at the end of the log, so the replay at the bottom
+    # of this test can only be showing what this test sends.
+    prime = await connect_client(port=history_port)
+    await prime.appstart()
+    await drain_history_until_no_more(prime)
+    await prime.close()
+    await asyncio.sleep(0.3)
+
+    # The watcher sits on the anonymous listener: it receives the synthesized
+    # echo live but owns no history cursor, so it cannot consume the replay.
+    watcher = await connect_client(port=proxy_port)
+    sender = await connect_client(port=history_port)
+    await sender.appstart()
+
+    first = await sender.send_chan_msg(0, text, ts=ts)
+    resent = await sender.send_chan_msg(0, text, ts=ts)
+    if first is None or resent is None:
+        await sender.close()
+        await watcher.close()
+        fail("SEND_CHAN_MSG did not produce OK")
+        return
+    ok("the message and its resend were both accepted by the radio")
+
+    live = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 2.0:
+        p = await watcher.recv(0.2)
+        if p and is_channel_frame(p) and needle in p:
+            live.append(p)
+    await sender.close()
+    await watcher.close()
+
+    if len(live) == 1:
+        ok("the idle client saw the resent message broadcast once")
+    else:
+        fail(f"the idle client saw the resent message {len(live)} times, expected 1")
+
+    h = await connect_client(port=history_port)
+    await h.appstart()
+    frames = await drain_history_until_no_more(h)
+    await h.close()
+
+    replayed = [f for f in frames if needle in f]
+    if len(replayed) == 1:
+        ok("the log holds the resent message once, so replay is not duplicated")
+    else:
+        fail(f"replay handed the resent message over {len(replayed)} times, expected 1")
+
+    # The surviving row must be the echoed frame itself: suppressing the second
+    # echo is not allowed to change what a client receives.
+    if replayed and msg_text(replayed[0]).startswith("FakeRadio: "):
+        ok("the replayed frame is still the radio-prefixed echo")
+    elif replayed:
+        fail(f"replayed frame lost its sender prefix: {msg_text(replayed[0])[:40]!r}")
+
+
 # --- Harness ---
 
 _fake_proc = None
