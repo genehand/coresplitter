@@ -303,21 +303,23 @@ impl NodeState {
             .map(i64::from_le_bytes))
     }
 
-    /// Persist a listener's replay cursor.
+    /// Persist a listener's replay cursor, returning the value now stored.
     ///
     /// Cursors only ever move forward, and every client on a listener writes
-    /// the same key. A stale writer — the reaper retiring a client that has
+    /// the same key. A stale writer -- the reaper retiring a client that has
     /// already gone away, or shutdown flushing several entries for one listener
-    /// in arbitrary order — must therefore not drag the cursor back to a frame
-    /// the listener has already consumed.
-    pub async fn set_history_cursor(&self, listener: &str, id: i64) -> Result<()> {
+    /// in arbitrary order -- must therefore not drag the cursor back to a frame
+    /// the listener has already consumed. The caller gets the current value
+    /// back so it can tell a no-op from its own write.
+    pub async fn set_history_cursor(&self, listener: &str, id: i64) -> Result<i64> {
         if let Some(current) = self.history_cursor(listener).await?
             && current >= id
         {
-            return Ok(());
+            return Ok(current);
         }
         self.kv_set(&history_cursor_key(listener), &id.to_le_bytes())
-            .await
+            .await?;
+        Ok(id)
     }
 
     // --- Key-value store ---
@@ -494,10 +496,12 @@ mod tests {
         let (state, _) = test_state("cursor-monotonic").await;
 
         state.set_history_cursor("phone", 43).await.unwrap();
-        state.set_history_cursor("phone", 12).await.unwrap();
+        // A backwards write is a no-op that reports what is actually stored,
+        // so a caller tracking its own position cannot believe it moved.
+        assert_eq!(state.set_history_cursor("phone", 12).await.unwrap(), 43);
         assert_eq!(state.history_cursor("phone").await.unwrap(), Some(43));
 
-        state.set_history_cursor("phone", 44).await.unwrap();
+        assert_eq!(state.set_history_cursor("phone", 44).await.unwrap(), 44);
         assert_eq!(state.history_cursor("phone").await.unwrap(), Some(44));
     }
 

@@ -1251,6 +1251,23 @@ async def drain_history_until_no_more(client, limit: int = 60):
     return frames
 
 
+async def recv_until_channel(client, needle: bytes, timeout=5.0):
+    """Read frames until a channel message containing `needle` shows up.
+
+    The radio's periodic injector keeps emitting MESSAGES_WAITING (0x83) while
+    a test waits, so read directly instead of through `get_message`, which
+    would poll and pull those queued items out as well.
+    """
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        p = await client.recv(1)
+        if p is None:
+            return None
+        if is_channel_frame(p) and needle in p:
+            return p
+    return None
+
+
 async def test_history_replay(history_port, control_port):
     """Test 16: a named listener replays the logged channel history.
 
@@ -2279,6 +2296,81 @@ async def test_no_listener_means_no_message_log(control_port):
     if problems:
         fail("; ".join(problems))
     ok("message frames are logged only when a listener can replay them")
+
+
+async def test_live_cursor_is_persisted_while_connected(history_port, control_port):
+    """Test 33: a live session's cursor is persisted before it reconnects.
+
+    A socket can die without a FIN -- a laptop switching from ethernet to wifi
+    leaves the old connection half-open, writes still succeeding into the
+    kernel buffer -- and the proxy keeps that client in `ClientDirectMap` until
+    the idle sweep notices, minutes later. The frames written into that socket
+    never arrive, so the shared cursor may only be persisted up to what the
+    client acknowledged by speaking. Persisted on the tick instead of only at
+    disconnect, a reconnect (a *new* client id, the dead one still counted
+    alive) resumes where the app actually was instead of replaying everything
+    it has already been shown.
+
+    The second half pins the other side of the same cap: a frame that arrived
+    after the last acknowledgement is *not* persisted, so it is still replayed
+    rather than silently skipped.
+    """
+    log.info("--- Test 33: the cursor of a live session is persisted ---")
+    ctl = await connect_control(control_port)
+
+    # A log that is not empty when the client connects, so the session has a
+    # replay position to start from: on an empty log `begin_history_sync` keeps
+    # no state at all, and the first logged frame would create it mid-flight.
+    seed = b"Cursor seed"
+    await ctl.push(v3_channel_frame(0, seed).hex())
+    await asyncio.sleep(0.3)
+
+    a = await connect_client(port=history_port)
+    await a.appstart()
+    await drain_history_until_no_more(a)
+
+    # Delivered live, then acknowledged with a poll the way the app answers a
+    # MESSAGES_WAITING push. The acknowledgement is what makes the frame
+    # persistable: TCP delivers in order, so a command proves it arrived.
+    seen = b"Cursor confirmed live"
+    await ctl.push(v3_channel_frame(0, seen).hex())
+    if await recv_until_channel(a, seen) is None:
+        await a.close()
+        await ctl.close()
+        fail("the first client never saw the pushed frame live")
+    await a.get_message()
+    # The housekeeping tick is what persists it.
+    await asyncio.sleep(2.5)
+
+    # Logged after that acknowledgement and delivered live to a client that
+    # does not poll again: unconfirmed, so it must stay replayable.
+    unseen = b"After the acknowledgement"
+    await ctl.push(v3_channel_frame(0, unseen).hex())
+    if await recv_until_channel(a, unseen) is None:
+        await a.close()
+        await ctl.close()
+        fail("the first client never saw the unacknowledged frame live")
+
+    # A reconnect on the same listener name while the first client is still
+    # counted alive -- the address change, without the idle sweep in between.
+    b = await connect_client(port=history_port)
+    await b.appstart()
+    frames = await drain_history_until_no_more(b)
+    await b.close()
+    await a.close()
+    await ctl.close()
+
+    if any(seen in f for f in frames):
+        fail(
+            "a frame the first session already saw live was replayed to the "
+            f"reconnect ({len(frames)} frames replayed)"
+        )
+    ok("the acknowledged frame is not replayed after a reconnect")
+
+    if any(unseen in f for f in frames):
+        ok("the unacknowledged frame is replayed, not skipped")
+    else:
+        fail(f"a frame delivered after the last acknowledgement was skipped ({len(frames)})")
 
 
 # --- Harness ---

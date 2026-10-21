@@ -364,6 +364,14 @@ struct HistorySync {
     /// a client that has gone away must not be credited with frames logged
     /// after it left.
     live_high: i64,
+    /// `live_high` as of this client's most recent command. A frame provably
+    /// reached the client only if a command followed it, because TCP delivers
+    /// in order; so this, and not `live_high`, is what may be persisted while
+    /// the client is still connected. See `flush_confirmed_cursor`.
+    confirmed: i64,
+    /// Highest value this session has written to kv_store, so a tick with
+    /// nothing new costs no query.
+    flushed: i64,
     /// Oldest `recv_ts` this listener wants.
     since_ts: i64,
 }
@@ -823,6 +831,7 @@ impl Core {
         //    the message log until it catches up. The radio is never touched,
         //    and neither is the single in-flight slot.
         self.begin_history_sync(&cmd).await;
+        self.confirm_history_delivery(&cmd.client_id);
         if self.try_serve_history(&cmd).await {
             return;
         }
@@ -978,6 +987,8 @@ impl Core {
                 cursor,
                 head,
                 live_high: 0,
+                confirmed: 0,
+                flushed: cursor,
                 since_ts: history_window_start(cmd.listener.history_hours),
             },
         );
@@ -1086,6 +1097,11 @@ impl Core {
     /// would only duplicate them. A client that died mid-replay keeps its exact
     /// position, so a few frames it already saw may repeat, but none it never
     /// received are skipped.
+    ///
+    /// This is the *terminal* flush, run once the client is finished with:
+    /// shutdown, or the reaper finding it gone. It credits `live_high`, which
+    /// on a socket that closed cleanly is everything the peer received. For a
+    /// client that is still connected see `flush_confirmed_cursor`.
     async fn flush_history_cursor(&mut self, client_id: &ClientId, forget: bool) {
         let Some(sync) = self.history_sync.get(client_id) else {
             return;
@@ -1096,14 +1112,83 @@ impl Core {
         } else {
             sync.cursor
         };
-        if forget {
+        let stored = self.store_history_cursor(client_id, &listener, value).await;
+        if forget && stored {
             self.history_sync.remove(client_id);
         }
-        if let Err(e) = self.state.set_history_cursor(&listener, value).await {
-            tracing::warn!(error = %e, listener = %listener, "failed to persist history cursor");
+    }
+
+    /// Persist only what the client has provably received, while it is still
+    /// connected.
+    ///
+    /// `client_is_alive` is not the same as "the app is still reading". A
+    /// laptop moving from ethernet to wifi leaves a half-open socket behind:
+    /// no FIN, no RST, writes still succeeding into the kernel buffer, and the
+    /// frontend keeps the client in `ClientDirectMap` until the idle sweep
+    /// fires minutes later. Every frame written into such a socket is credited
+    /// to `live_high` and never arrives, so persisting that would skip those
+    /// frames on the next connect -- a reconnect racing the sweep is exactly
+    /// how a client ends up re-showing (or, worse, never seeing) its own
+    /// recent history.
+    ///
+    /// The cap is the watermark as of the client's last command
+    /// (`confirm_history_delivery`); anything newer is still replayable, and a
+    /// replay costs a duplicate at worst. Persisting on every tick keeps that
+    /// window at a second instead of the whole idle timeout.
+    async fn flush_confirmed_cursor(&mut self, client_id: &ClientId) {
+        let Some(sync) = self.history_sync.get(client_id) else {
             return;
+        };
+        let listener = sync.listener.clone();
+        let value = if sync.cursor >= sync.head {
+            sync.cursor.max(sync.confirmed)
+        } else {
+            sync.cursor
+        };
+        self.store_history_cursor(client_id, &listener, value).await;
+    }
+
+    /// Write `value` for `listener` unless kv_store already holds it or more.
+    ///
+    /// Returns false when the write failed, so the terminal flush can leave the
+    /// entry in place for the next tick to retry rather than dropping a
+    /// position nobody persisted.
+    async fn store_history_cursor(
+        &mut self,
+        client_id: &ClientId,
+        listener: &str,
+        value: i64,
+    ) -> bool {
+        if self
+            .history_sync
+            .get(client_id)
+            .is_some_and(|sync| sync.flushed >= value)
+        {
+            return true;
         }
-        tracing::debug!(listener = %listener, cursor = value, "persisted history cursor");
+        // Another session on the same listener may have moved the shared key
+        // past `value` since this one last looked; the stored value is what
+        // this session has to remember, or it would keep rewriting it.
+        let stored = match self.state.set_history_cursor(listener, value).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!(error = %e, listener = %listener, "failed to persist history cursor");
+                return false;
+            }
+        };
+        if let Some(sync) = self.history_sync.get_mut(client_id) {
+            sync.flushed = sync.flushed.max(stored);
+        }
+        tracing::debug!(listener = %listener, cursor = stored, "persisted history cursor");
+        true
+    }
+
+    /// Record what a client has provably received, from the fact that it just
+    /// spoke.
+    fn confirm_history_delivery(&mut self, client_id: &ClientId) {
+        if let Some(sync) = self.history_sync.get_mut(client_id) {
+            sync.confirmed = sync.live_high;
+        }
     }
 
     /// Periodic maintenance on the 1 s tick: retire clients that have gone
@@ -1122,6 +1207,20 @@ impl Core {
                 cmd = format_args!("0x{:02x}", ghost.cmd_code),
                 "no reply ever came for a timed-out request; dropping its ghost"
             );
+        }
+
+        // Persist what every live session provably received. Cheap when
+        // nothing moved (`store_history_cursor` short-circuits on `flushed`),
+        // and it is what keeps a half-open socket from stretching the replay
+        // window out to the idle timeout -- see `flush_confirmed_cursor`.
+        let live: Vec<ClientId> = self
+            .history_sync
+            .keys()
+            .filter(|client| self.client_is_alive(client))
+            .copied()
+            .collect();
+        for client in &live {
+            self.flush_confirmed_cursor(client).await;
         }
 
         let dead: Vec<ClientId> = self
