@@ -51,6 +51,18 @@ the physical radio — the proxy acts as a **faithful mirror**.
    RESET_PATH, IMPORT_CONTACT) the proxy queues a re-read of it so the
    cache keeps serving the radio's current frame. Late LoRa-delivery
    ACKs (0x82) are routed back to the original sender by `ack_code`.
+7. Missed messages: every message clients see (incoming, or echoed
+   from another client's send) is stored. A client is identified by
+   the frontend port it connects to plus the app name in its
+   APP_START (the app version is ignored, so updates keep the
+   history). When a known client reconnects, the messages it missed
+   are announced with MESSAGES_WAITING and served by its GET_MSG polls
+   before the radio is asked, exactly as a radio returns messages
+   queued while the app was away. Its own messages are never replayed
+   to it. Two copies of the same app (e.g. two phones with the
+   official app) look identical on one port; give each its own port
+   with `--tcp-frontend-port 5000,5001`. What a never-seen client gets
+   is set with `CORESPLITTER_NEW_CLIENT_BACKLOG`.
 
 ## Requirements
 
@@ -136,6 +148,7 @@ cargo run --release --features ble -- \
 | `CORESPLITTER_RECORD_RADIO_RX` | Record all raw radio RX to database |
 | `CORESPLITTER_MESSAGES_RETENTION_DAYS` | Days to keep stored messages, 0 = forever (default: 0) |
 | `CORESPLITTER_RAW_RX_RETENTION_DAYS` | Days to keep raw_rx recordings, 0 = forever (default: 7) |
+| `CORESPLITTER_NEW_CLIENT_BACKLOG` | Messages replayed to a never-seen client: 0 = none, N = last N messages, Nh / Nd = last N hours / days (default: 0) |
 | `CORESPLITTER_CONTACTS_RETENTION_DAYS` | Days a contact may be missing from the radio before it leaves the cache, 0 = never (default: 0) |
 
 ### Database maintenance
@@ -147,6 +160,8 @@ with an incremental vacuum.
 - **Messages** are kept forever unless a retention is set; they then
   expire by local arrival time, not by the sender's timestamp, which
   can be arbitrarily wrong.
+  A client offline for longer than the retention misses what was
+  purged meanwhile.
 - **Contacts** are kept by default even when the radio no longer
   reports them: the cache is a safeguard against a node losing its
   contacts (firmware reflash, factory reset). With a retention set, a
@@ -169,7 +184,7 @@ uv run tools/test_proxy.py
 All tests run sequentially. Each cycle spawns a fresh proxy and fake radio,
 runs the tests, and cleans up.
 
-### Current tests (14 cases, 26 assertions, all PASS)
+### Current tests (17 cases, 30 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -186,7 +201,10 @@ runs the tests, and cleans up.
 | 11 | Cached GET_CONTACTS mirrors radio | Cached CONTACT frames keep flags, path and lastmod; the `since` filter, START count and END lastmod follow the firmware |
 | 12 | ADD_UPDATE_CONTACT refreshes cache | After the radio accepts a contact update, the cached list shows its new name, path and lastmod |
 | 13 | Rejected send not echoed | SEND_CHAN_MSG to an unknown channel gets ERROR and no echo reaches the other client |
-| 14 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
+| 14 | Missed messages replayed | A client that was offline gets the message it missed through GET_MSG on reconnect, and only once |
+| 15 | Own messages not replayed | A client that sends and disconnects does not get its own message back on reconnect |
+| 16 | Same app on two ports | Two copies of the same app on different ports each get the missed message |
+| 17 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
 
 ### Fake radio
 
@@ -215,4 +233,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 26/26 PASS (14 cases) on TCP backend against fake radio
+- **Tests**: 30/30 PASS (17 cases) on TCP backend against fake radio

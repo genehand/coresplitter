@@ -32,6 +32,9 @@ impl std::fmt::Display for ClientId {
 #[derive(Debug)]
 pub struct ClientCommand {
     pub client_id: ClientId,
+    /// Local port the client connected to. Together with the app name in
+    /// APP_START it identifies the client across reconnections.
+    pub local_port: u16,
     pub payload: Vec<u8>,
 }
 
@@ -164,6 +167,7 @@ async fn handle_client(
     tracing::info!(client = %client_id, addr = %addr, "client connected");
 
     let _ = stream.set_nodelay(true);
+    let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
 
     let (mut reader, mut writer) = stream.into_split();
     let mut parser = FrameParser::new();
@@ -185,7 +189,11 @@ async fn handle_client(
                             len = payload.len(),
                             "received command from client"
                         );
-                        let cmd = ClientCommand { client_id, payload };
+                        let cmd = ClientCommand {
+                            client_id,
+                            local_port,
+                            payload,
+                        };
                         if command_tx.send(cmd).is_err() {
                             return;
                         }

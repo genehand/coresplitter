@@ -9,7 +9,7 @@ use tokio::time::{self, Duration};
 
 use crate::backend;
 use crate::frontend::tcp::{ClientCommand, ClientDirectMap, ClientId, TcpFrontend};
-use crate::node::state::{CachedChannel, CachedContact, NodeState, Retention};
+use crate::node::state::{Backlog, CachedChannel, CachedContact, NewMessage, NodeState, Retention};
 use crate::protocol::decode::{
     DecodedValue, decode_command_payload, decode_response_payload, format_decoded,
 };
@@ -95,12 +95,26 @@ struct InFlight {
     /// Wall-clock dispatch time (unix secs), comparable with DB timestamps.
     sent_unix: i64,
     awaiting: Awaiting,
+    /// (port, app name) of the requesting client, captured at dispatch so
+    /// it is still known if the client disconnects before the reply.
+    origin: Option<(u16, String)>,
 }
 
 impl InFlight {
     fn cmd_code(&self) -> u8 {
         self.payload[0]
     }
+}
+
+/// A connected client that has identified itself with APP_START.
+#[derive(Debug)]
+struct Session {
+    port: u16,
+    app_name: String,
+    /// Stored messages it missed while offline, served one per GET_MSG
+    /// before the radio is asked. While non-empty its cursor advances
+    /// only as these are delivered.
+    pending: VecDeque<i64>,
 }
 
 #[derive(Debug)]
@@ -179,6 +193,7 @@ pub struct CoreConfig {
     pub event_log_json: bool,
     pub record_radio_rx: bool,
     pub retention: Retention,
+    pub new_client_backlog: Backlog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +233,9 @@ pub struct Core {
     // closes login/status/telemetry requests, which never produce an
     // ACK, so without eviction those entries would accumulate forever.
     pending_acks: HashMap<[u8; 4], (ClientId, Instant)>,
+    // Identified clients, keyed by connection. Entries of disconnected
+    // clients are dropped lazily (see follow_head).
+    sessions: HashMap<ClientId, Session>,
 }
 
 impl Core {
@@ -249,6 +267,7 @@ impl Core {
             in_flight: None,
             pending_queue: VecDeque::new(),
             pending_acks: HashMap::new(),
+            sessions: HashMap::new(),
         })
     }
 
@@ -675,6 +694,7 @@ impl Core {
                 last_activity: Instant::now(),
                 sent_unix: chrono::Utc::now().timestamp(),
                 awaiting: awaiting_for(&next.payload),
+                origin: next.client_id.and_then(|cid| self.identity_of(&cid)),
                 payload: next.payload,
             });
             return Some(());
@@ -702,8 +722,19 @@ impl Core {
         let cmd_code = cmd.payload[0];
         self.log_event("->", cmd_code, &cmd.payload);
 
+        if cmd_code == 0x01 {
+            self.register_session(&cmd).await;
+        }
+        // Messages missed while offline are served before asking the radio.
+        if cmd_code == 0x0A && self.replay_next_missed(&cmd.client_id).await {
+            return;
+        }
+
         // 1. Cache-only paths: serve from RAM / SQLite, never touch the radio.
         if self.try_serve_from_cache(cmd_code, &cmd).await {
+            if cmd_code == 0x01 {
+                self.notify_missed(&cmd.client_id);
+            }
             return;
         }
 
@@ -817,14 +848,28 @@ impl Core {
             last_activity: Instant::now(),
             sent_unix: chrono::Utc::now().timestamp(),
             awaiting: awaiting_for(&payload),
+            origin: client_id.and_then(|cid| self.identity_of(&cid)),
             payload,
         });
+    }
+
+    fn identity_of(&self, client_id: &ClientId) -> Option<(u16, String)> {
+        self.sessions
+            .get(client_id)
+            .map(|s| (s.port, s.app_name.clone()))
     }
 
     /// Side effects of a command that only make sense once the radio has
     /// accepted it, i.e. its reply was anything but ERROR.
     async fn on_command_accepted(&mut self, done: &InFlight) {
         let (client_id, payload) = (done.client_id, done.payload.as_slice());
+
+        // APP_START answered by the radio itself (no cached SELF_INFO yet).
+        if payload[0] == 0x01
+            && let Some(cid) = client_id
+        {
+            self.notify_missed(&cid);
+        }
         // Contact table changes: re-read what the radio now holds so the
         // cache serves the same frame (path, flags, lastmod) it would.
         match payload[0] {
@@ -849,10 +894,12 @@ impl Core {
         if let Some(cid) = client_id {
             match payload[0] {
                 0x02 if payload.len() >= 14 => {
-                    self.synthesize_contact_echo(&cid, payload).await;
+                    self.synthesize_contact_echo(&cid, done.origin.as_ref(), payload)
+                        .await;
                 }
                 0x03 if payload.len() >= 8 => {
-                    self.synthesize_channel_echo(&cid, payload).await;
+                    self.synthesize_channel_echo(&cid, done.origin.as_ref(), payload)
+                        .await;
                 }
                 _ => {}
             }
@@ -892,13 +939,161 @@ impl Core {
         }
     }
 
+    /// Identify the client from APP_START as (local port, app name) and
+    /// work out which stored messages it hasn't seen. app_ver is left out
+    /// so an updated app keeps its history.
+    async fn register_session(&mut self, cmd: &ClientCommand) {
+        // APP_START: [0x01, app_ver, reserved(6), app_name...]
+        let app_name = cmd
+            .payload
+            .get(8..)
+            .map(|b| {
+                String::from_utf8_lossy(b)
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let port = cmd.local_port;
+
+        let pending = match self.state.client_cursor(port, &app_name).await {
+            Ok(Some(cursor)) => self.state.message_ids_after(cursor, port, &app_name).await,
+            Ok(None) => {
+                self.state
+                    .backlog_message_ids(self.config.new_client_backlog, port, &app_name)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let pending: VecDeque<i64> = match pending {
+            Ok(ids) => ids.into(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load missed messages");
+                VecDeque::new()
+            }
+        };
+
+        // Nothing pending: the client is up to date from here on. Otherwise
+        // leave the cursor just below the first pending message (this also
+        // records a client seen for the first time).
+        let cursor = match pending.front() {
+            None => self.state.message_head().await.unwrap_or(0),
+            Some(first) => first - 1,
+        };
+        if let Err(e) = self
+            .state
+            .advance_client_cursor(port, &app_name, cursor)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to record client");
+        }
+
+        tracing::info!(
+            client = %cmd.client_id,
+            port,
+            app = %app_name,
+            missed = pending.len(),
+            "client identified"
+        );
+        self.sessions.insert(
+            cmd.client_id,
+            Session {
+                port,
+                app_name,
+                pending,
+            },
+        );
+    }
+
+    /// Tell a freshly identified client it has messages waiting, the same
+    /// way the radio does, so it starts polling with GET_MSG.
+    fn notify_missed(&self, client_id: &ClientId) {
+        if self
+            .sessions
+            .get(client_id)
+            .is_some_and(|s| !s.pending.is_empty())
+        {
+            self.send_to_client(client_id, vec![0x83]);
+        }
+    }
+
+    /// Answer a GET_MSG with the next message the client missed. Returns
+    /// false when there is none left, so the radio is asked instead.
+    async fn replay_next_missed(&mut self, client_id: &ClientId) -> bool {
+        let Some(session) = self.sessions.get(client_id) else {
+            return false;
+        };
+        let (port, app_name) = (session.port, session.app_name.clone());
+        let mut served = false;
+        while let Some(id) = self
+            .sessions
+            .get_mut(client_id)
+            .and_then(|s| s.pending.pop_front())
+        {
+            // May have been purged by retention since; skip it.
+            let Ok(Some(frame)) = self.state.message_frame(id).await else {
+                continue;
+            };
+            self.send_to_client(client_id, frame);
+            let _ = self.state.advance_client_cursor(port, &app_name, id).await;
+            served = true;
+            break;
+        }
+        // Caught up: from now on the cursor follows live traffic.
+        if self
+            .sessions
+            .get(client_id)
+            .is_some_and(|s| s.pending.is_empty())
+            && let Ok(head) = self.state.message_head().await
+        {
+            let _ = self
+                .state
+                .advance_client_cursor(port, &app_name, head)
+                .await;
+        }
+        served
+    }
+
+    /// Persist a message as clients saw it and advance the cursor of every
+    /// connected, caught-up client: they got it live, or sent it.
+    /// `msg.origin` is the client whose SEND_* produced it (None for radio
+    /// traffic), so the message is never replayed back to that client.
+    async fn store_message(&mut self, msg: NewMessage<'_>) -> Result<()> {
+        let id = self.state.insert_message(&msg).await?;
+        self.follow_head(id).await;
+        Ok(())
+    }
+
+    async fn follow_head(&mut self, id: i64) {
+        let mut identities: Vec<(u16, String)> = {
+            let channels = self.client_channels.lock().unwrap();
+            self.sessions.retain(|cid, _| channels.contains_key(cid));
+            self.sessions
+                .values()
+                .filter(|s| s.pending.is_empty())
+                .map(|s| (s.port, s.app_name.clone()))
+                .collect()
+        };
+        identities.sort();
+        identities.dedup();
+        for (port, app_name) in identities {
+            if let Err(e) = self.state.advance_client_cursor(port, &app_name, id).await {
+                tracing::warn!(error = %e, "failed to advance client cursor");
+            }
+        }
+    }
+
     fn client_is_alive(&self, client_id: &ClientId) -> bool {
         self.client_channels.lock().unwrap().contains_key(client_id)
     }
 
     /// Synthesize a CONTACT_MSG_RECV (0x07) for the rest of the clients so
     /// they see this message as if it had arrived over LoRa from the radio.
-    async fn synthesize_contact_echo(&self, sender: &ClientId, payload: &[u8]) {
+    async fn synthesize_contact_echo(
+        &mut self,
+        sender: &ClientId,
+        origin: Option<&(u16, String)>,
+        payload: &[u8],
+    ) {
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_MSG");
             return;
@@ -918,13 +1113,25 @@ impl Core {
         self.broadcast_to_others(Some(sender), &fake);
 
         let _ = self
-            .state
-            .insert_message("contact", Some(from_key), None, &text, ts)
+            .store_message(NewMessage {
+                msg_type: "contact",
+                from_key: Some(from_key),
+                channel_idx: None,
+                text: &text,
+                timestamp: ts,
+                frame: &fake,
+                origin: origin.map(|(port, app)| (*port, app.as_str())),
+            })
             .await;
     }
 
     /// Synthesize a CHANNEL_MSG_RECV (0x08) for the rest of the clients.
-    async fn synthesize_channel_echo(&self, sender: &ClientId, payload: &[u8]) {
+    async fn synthesize_channel_echo(
+        &mut self,
+        sender: &ClientId,
+        origin: Option<&(u16, String)>,
+        payload: &[u8],
+    ) {
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG");
             return;
@@ -944,8 +1151,15 @@ impl Core {
         self.broadcast_to_others(Some(sender), &fake);
 
         let _ = self
-            .state
-            .insert_message("channel", Some(from_key), Some(channel), &text, ts)
+            .store_message(NewMessage {
+                msg_type: "channel",
+                from_key: Some(from_key),
+                channel_idx: Some(channel),
+                text: &text,
+                timestamp: ts,
+                frame: &fake,
+                origin: origin.map(|(port, app)| (*port, app.as_str())),
+            })
             .await;
     }
 
@@ -1278,8 +1492,15 @@ impl Core {
                         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
                     if let Err(e) = self
-                        .state
-                        .insert_message("contact", from_key.as_deref(), None, &text, ts)
+                        .store_message(NewMessage {
+                            msg_type: "contact",
+                            from_key: from_key.as_deref(),
+                            channel_idx: None,
+                            text: &text,
+                            timestamp: ts,
+                            frame: payload,
+                            origin: None,
+                        })
                         .await
                     {
                         tracing::warn!(error = %e, "failed to cache message");
@@ -1308,8 +1529,15 @@ impl Core {
                         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
                     if let Err(e) = self
-                        .state
-                        .insert_message("channel", None, channel_idx, &text, ts)
+                        .store_message(NewMessage {
+                            msg_type: "channel",
+                            from_key: None,
+                            channel_idx,
+                            text: &text,
+                            timestamp: ts,
+                            frame: payload,
+                            origin: None,
+                        })
                         .await
                     {
                         tracing::warn!(error = %e, "failed to cache channel message");
@@ -1327,8 +1555,15 @@ impl Core {
                     String::new()
                 };
                 if let Err(e) = self
-                    .state
-                    .insert_message("contact", from_key.as_deref(), None, &text, ts)
+                    .store_message(NewMessage {
+                        msg_type: "contact",
+                        from_key: from_key.as_deref(),
+                        channel_idx: None,
+                        text: &text,
+                        timestamp: ts,
+                        frame: payload,
+                        origin: None,
+                    })
                     .await
                 {
                     tracing::warn!(error = %e, "failed to cache V3 contact message");
@@ -1343,8 +1578,15 @@ impl Core {
                     String::new()
                 };
                 if let Err(e) = self
-                    .state
-                    .insert_message("channel", None, Some(channel_idx), &text, ts)
+                    .store_message(NewMessage {
+                        msg_type: "channel",
+                        from_key: None,
+                        channel_idx: Some(channel_idx),
+                        text: &text,
+                        timestamp: ts,
+                        frame: payload,
+                        origin: None,
+                    })
                     .await
                 {
                     tracing::warn!(error = %e, "failed to cache V3 channel message");

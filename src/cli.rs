@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::core::{BackendType, CoreConfig, LogLevel};
-use crate::node::state::Retention;
+use crate::node::state::{Backlog, Retention};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -97,6 +97,11 @@ pub struct Cli {
         env = "CORESPLITTER_CONTACTS_RETENTION_DAYS"
     )]
     pub contacts_retention_days: u32,
+
+    /// Messages replayed to a client seen for the first time: 0 = none,
+    /// N = the last N messages, Nh / Nd = those of the last N hours / days
+    #[arg(long, default_value = "0", env = "CORESPLITTER_NEW_CLIENT_BACKLOG")]
+    pub new_client_backlog: Backlog,
 }
 
 impl Cli {
@@ -136,6 +141,7 @@ impl Cli {
                 raw_rx_days: self.raw_rx_retention_days,
                 contacts_days: self.contacts_retention_days,
             },
+            new_client_backlog: self.new_client_backlog,
         }
     }
 }

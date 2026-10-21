@@ -18,6 +18,8 @@ log = logging.getLogger("test")
 
 # --- Helpers ---
 
+_client_seq = 0
+
 class Client:
     def __init__(self, reader, writer):
         self.r = reader
@@ -41,8 +43,15 @@ class Client:
         payload = await asyncio.wait_for(self.r.readexactly(length), timeout)
         return payload
 
-    async def appstart(self):
-        await self.send(b"\x01\x01" + b"testclient")
+    async def appstart(self, name: str | None = None):
+        # [0x01, app_ver, reserved(6), app_name]. The proxy identifies the
+        # client by (port, app_name); a unique default name keeps tests
+        # from sharing a message history unless they ask to.
+        global _client_seq
+        if name is None:
+            _client_seq += 1
+            name = f"test-{os.getpid()}-{_client_seq}"
+        await self.send(b"\x01\x01" + b"\x00" * 6 + name.encode())
         t0 = time.monotonic()
         while time.monotonic() - t0 < 10:
             p = await self.recv(2)
@@ -498,7 +507,7 @@ async def test_send_contact_msg(proxy_port):
 
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
-    log.info("--- Test 14: TCP disconnection + reconnection ---")
+    log.info("--- Test 17: TCP disconnection + reconnection ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -858,6 +867,105 @@ async def test_update_contact_refreshes_cache(proxy_port):
     await c.close()
 
 
+async def _drain_for_text(c, text: bytes, polls: int = 5):
+    """Poll GET_MSG until a frame containing `text` shows up, the radio
+    says NO_MORE_MSGS, or `polls` runs out. Returns the matching frame."""
+    for _ in range(polls):
+        p = await c.get_message()
+        if not p:
+            return None
+        if text in p:
+            return p
+        if p[0] == 0x0A:
+            return None
+    return None
+
+
+async def test_missed_messages_replayed(proxy_port):
+    log.info("--- Test 14: Missed messages replayed on reconnect ---")
+    a = await connect_client(port=proxy_port)
+    if not await a.appstart("replay-app"):
+        fail("SELF_INFO failed")
+        await a.close()
+        return
+    await a.close()
+    await asyncio.sleep(0.5)  # let the proxy notice the disconnect
+
+    b = await connect_client(port=proxy_port)
+    await b.appstart()
+    if not await b.send_chan_msg(0, "while you were away"):
+        fail("SEND_CHAN_MSG failed")
+        await b.close()
+        return
+    await b.close()
+
+    a = await connect_client(port=proxy_port)
+    await a.appstart("replay-app")
+    if await _drain_for_text(a, b"while you were away"):
+        ok("reconnecting client gets the message it missed via GET_MSG")
+    else:
+        fail("missed message was not replayed on reconnect")
+
+    # Caught up now: reconnecting again must not replay it a second time.
+    await a.close()
+    await asyncio.sleep(0.5)
+    a = await connect_client(port=proxy_port)
+    await a.appstart("replay-app")
+    if await _drain_for_text(a, b"while you were away", polls=3):
+        fail("message replayed twice")
+    else:
+        ok("already delivered message is not replayed again")
+    await a.close()
+
+
+async def test_own_messages_not_replayed(proxy_port):
+    log.info("--- Test 15: Own messages are not replayed ---")
+    a = await connect_client(port=proxy_port)
+    if not await a.appstart("echo-app"):
+        fail("SELF_INFO failed")
+        await a.close()
+        return
+    await a.send_chan_msg(0, "my own words")
+    await a.close()
+    await asyncio.sleep(0.5)
+
+    a = await connect_client(port=proxy_port)
+    await a.appstart("echo-app")
+    if await _drain_for_text(a, b"my own words", polls=3):
+        fail("client got its own message back on reconnect")
+    else:
+        ok("client's own message is not replayed to it")
+    await a.close()
+
+
+async def test_same_app_two_ports(proxy_port, proxy_port2):
+    log.info("--- Test 16: Same app on two ports keeps separate histories ---")
+    for port in (proxy_port, proxy_port2):
+        c = await connect_client(port=port)
+        if not await c.appstart("twin-app"):
+            fail(f"SELF_INFO failed on port {port}")
+            await c.close()
+            return
+        await c.close()
+    await asyncio.sleep(0.5)
+
+    sender = await connect_client(port=proxy_port)
+    await sender.appstart()
+    await sender.send_chan_msg(0, "for both twins")
+    await sender.close()
+
+    got = []
+    for port in (proxy_port, proxy_port2):
+        c = await connect_client(port=port)
+        await c.appstart("twin-app")
+        got.append(bool(await _drain_for_text(c, b"for both twins")))
+        await c.close()
+    if all(got):
+        ok("each port's copy of the same app gets the missed message")
+    else:
+        fail(f"missed message per port (port1, port2): {got}")
+
+
 # --- Harness ---
 
 fake_proc = None
@@ -907,6 +1015,7 @@ async def main():
         return
 
     proxy_port = await find_free_port()
+    proxy_port2 = await find_free_port()
 
     proxy_bin = os.path.join(
         os.path.dirname(__file__), "..", "target", "debug", "coresplitter"
@@ -915,7 +1024,7 @@ async def main():
         proxy_bin,
         "--tcp-backend-host", "127.0.0.1",
         "--tcp-backend-port", str(fake_port),
-        "--tcp-frontend-port", str(proxy_port),
+        "--tcp-frontend-port", f"{proxy_port},{proxy_port2}",
         "--data-dir", DATA_DIR,
         "--log-level", "info",
         stdout=asyncio.subprocess.PIPE,
@@ -953,6 +1062,9 @@ async def main():
     await test_contacts_served_verbatim(proxy_port)
     await test_update_contact_refreshes_cache(proxy_port)
     await test_rejected_send_not_echoed(proxy_port)
+    await test_missed_messages_replayed(proxy_port)
+    await test_own_messages_not_replayed(proxy_port)
+    await test_same_app_two_ports(proxy_port, proxy_port2)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL

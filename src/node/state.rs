@@ -25,6 +25,12 @@ pub struct CachedChannel {
     pub config: Option<Vec<u8>>,
 }
 
+/// SQL condition for messages that can be replayed to the client bound
+/// as ?2 (port) and ?3 (app name): it has a stored frame and wasn't sent
+/// by that same client.
+const REPLAYABLE_TO: &str = "frame IS NOT NULL \
+     AND (origin_port IS NULL OR origin_port != ?2 OR origin_app != ?3)";
+
 pub struct NodeState {
     pool: SqlitePool,
 }
@@ -114,6 +120,21 @@ impl NodeState {
         .execute(&self.pool)
         .await?;
 
+        // Clients are identified by (local port, app name from APP_START).
+        // last_seen_id is the highest messages.id the client has seen, either
+        // live or replayed; whatever is above it is delivered on reconnect.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS clients (
+                port INTEGER NOT NULL,
+                app_name TEXT NOT NULL,
+                last_seen_id INTEGER NOT NULL,
+                last_connected_at INTEGER NOT NULL,
+                PRIMARY KEY (port, app_name)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Drop obsolete kv_store entries from prior versions. self_info/
         // device_info/battery_info used to be JSON; identity.* was a SHA256
         // pseudo-keypair that no longer exists.
@@ -133,6 +154,16 @@ impl NodeState {
         // Local arrival time; `timestamp` is the sender's clock and can't be
         // trusted for retention.
         self.add_column_if_missing("messages", "received_at", "INTEGER")
+            .await?;
+        // The message frame as clients saw it, replayed to clients that
+        // were offline. Rows from older versions have none and aren't.
+        self.add_column_if_missing("messages", "frame", "BLOB")
+            .await?;
+        // Client identity that sent the message through the proxy (NULL for
+        // traffic from the radio), so it is never replayed back to it.
+        self.add_column_if_missing("messages", "origin_port", "INTEGER")
+            .await?;
+        self.add_column_if_missing("messages", "origin_app", "TEXT")
             .await?;
 
         // auto_vacuum only takes effect on a database without tables, or
@@ -232,27 +263,140 @@ impl NodeState {
 
     // --- Messages ---
 
-    pub async fn insert_message(
-        &self,
-        msg_type: &str,
-        from_key: Option<&[u8]>,
-        channel_idx: Option<i64>,
-        text: &str,
-        timestamp: i64,
-    ) -> Result<i64> {
+    pub async fn insert_message(&self, msg: &NewMessage<'_>) -> Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO messages (msg_type, from_key, channel_idx, text, timestamp, received_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages
+                 (msg_type, from_key, channel_idx, text, timestamp, received_at, frame,
+                  origin_port, origin_app)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
-        .bind(msg_type)
-        .bind(from_key)
-        .bind(channel_idx)
-        .bind(text)
-        .bind(timestamp)
+        .bind(msg.msg_type)
+        .bind(msg.from_key)
+        .bind(msg.channel_idx)
+        .bind(msg.text)
+        .bind(msg.timestamp)
         .bind(chrono::Utc::now().timestamp())
+        .bind(msg.frame)
+        .bind(msg.origin.map(|(port, _)| i64::from(port)))
+        .bind(msg.origin.map(|(_, app)| app))
         .execute(&self.pool)
         .await?;
         Ok(result.last_insert_rowid())
+    }
+
+    /// Highest message id stored so far (0 when there are none).
+    pub async fn message_head(&self) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM messages")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Ids of messages above `after` to replay to a client, oldest first.
+    /// Leaves out those the client itself sent.
+    pub async fn message_ids_after(
+        &self,
+        after: i64,
+        port: u16,
+        app_name: &str,
+    ) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT id FROM messages WHERE id > ?1 AND {REPLAYABLE_TO} ORDER BY id"
+        ))
+        .bind(after)
+        .bind(i64::from(port))
+        .bind(app_name)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Ids of the replayable messages a client seen for the first time
+    /// gets, oldest first.
+    pub async fn backlog_message_ids(
+        &self,
+        backlog: Backlog,
+        port: u16,
+        app_name: &str,
+    ) -> Result<Vec<i64>> {
+        let ids = match backlog {
+            Backlog::Off => Vec::new(),
+            Backlog::Messages(n) => {
+                sqlx::query_scalar(&format!(
+                    "SELECT id FROM (
+                         SELECT id FROM messages WHERE ?1 = ?1 AND {REPLAYABLE_TO}
+                         ORDER BY id DESC LIMIT ?4
+                     ) ORDER BY id"
+                ))
+                .bind(0)
+                .bind(i64::from(port))
+                .bind(app_name)
+                .bind(i64::from(n))
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Backlog::Seconds(secs) => {
+                sqlx::query_scalar(&format!(
+                    "SELECT id FROM messages
+                     WHERE received_at >= ?1 AND {REPLAYABLE_TO} ORDER BY id"
+                ))
+                .bind(chrono::Utc::now().timestamp() - secs)
+                .bind(i64::from(port))
+                .bind(app_name)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(ids)
+    }
+
+    /// The stored frame of a message, if it still exists.
+    pub async fn message_frame(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        Ok(
+            sqlx::query_scalar("SELECT frame FROM messages WHERE id = ?1 AND frame IS NOT NULL")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    // --- Clients ---
+
+    /// Last message id seen by a client, `None` if it never connected.
+    pub async fn client_cursor(&self, port: u16, app_name: &str) -> Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar(
+                "SELECT last_seen_id FROM clients WHERE port = ?1 AND app_name = ?2",
+            )
+            .bind(i64::from(port))
+            .bind(app_name)
+            .fetch_optional(&self.pool)
+            .await?,
+        )
+    }
+
+    /// Move a client's cursor forward to `seen_id`; never backwards, since
+    /// two sessions of the same identity may report out of order.
+    pub async fn advance_client_cursor(
+        &self,
+        port: u16,
+        app_name: &str,
+        seen_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO clients (port, app_name, last_seen_id, last_connected_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (port, app_name) DO UPDATE SET
+                 last_seen_id = MAX(last_seen_id, excluded.last_seen_id),
+                 last_connected_at = excluded.last_connected_at",
+        )
+        .bind(i64::from(port))
+        .bind(app_name)
+        .bind(seen_id)
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // --- Key-value store ---
@@ -353,6 +497,52 @@ impl NodeState {
     }
 }
 
+/// A message to store: decoded fields plus the frame clients saw.
+pub struct NewMessage<'a> {
+    pub msg_type: &'a str,
+    pub from_key: Option<&'a [u8]>,
+    pub channel_idx: Option<i64>,
+    pub text: &'a str,
+    /// Sender's clock, as carried in the frame.
+    pub timestamp: i64,
+    pub frame: &'a [u8],
+    /// (port, app name) of the client that sent it through the proxy.
+    pub origin: Option<(u16, &'a str)>,
+}
+
+/// What a client connecting for the first time gets replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backlog {
+    Off,
+    /// The last N messages.
+    Messages(u32),
+    /// Messages received in the last N seconds.
+    Seconds(i64),
+}
+
+impl std::str::FromStr for Backlog {
+    type Err = String;
+
+    /// `0` disables it, `N` means N messages, `Nh` / `Nd` a time window.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.trim();
+        let (num, unit) = match s.char_indices().last() {
+            Some((i, c)) if c.is_ascii_alphabetic() => (&s[..i], Some(c.to_ascii_lowercase())),
+            _ => (s, None),
+        };
+        let n: u32 = num
+            .parse()
+            .map_err(|_| format!("invalid backlog {s:?}: expected N, Nh or Nd"))?;
+        Ok(match (n, unit) {
+            (0, _) => Backlog::Off,
+            (n, None) => Backlog::Messages(n),
+            (n, Some('h')) => Backlog::Seconds(i64::from(n) * 3600),
+            (n, Some('d')) => Backlog::Seconds(i64::from(n) * 86_400),
+            (_, Some(u)) => return Err(format!("invalid backlog unit {u:?}: use h or d")),
+        })
+    }
+}
+
 /// Retention periods in days; 0 disables purging for that table.
 #[derive(Debug, Clone, Copy)]
 pub struct Retention {
@@ -421,11 +611,27 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         // Sender clock in 1970 but received just now: must survive.
         state
-            .insert_message("channel", None, Some(0), "fresh", 0)
+            .insert_message(&NewMessage {
+                msg_type: "channel",
+                from_key: None,
+                channel_idx: Some(0),
+                text: "fresh",
+                timestamp: 0,
+                frame: &[0x08],
+                origin: None,
+            })
             .await
             .unwrap();
         let old = state
-            .insert_message("channel", None, Some(0), "old", now)
+            .insert_message(&NewMessage {
+                msg_type: "channel",
+                from_key: None,
+                channel_idx: Some(0),
+                text: "old",
+                timestamp: now,
+                frame: &[0x08],
+                origin: None,
+            })
             .await
             .unwrap();
         sqlx::query("UPDATE messages SET received_at = ?1 WHERE id = ?2")
@@ -501,5 +707,89 @@ mod tests {
         state.set_contacts_synced_at(now - 45 * DAY).await.unwrap();
         assert_eq!(state.maintain(&retention).await.unwrap().contacts, 0);
         assert_eq!(contact_keys(&state).await, [2, 3]);
+    }
+
+    #[test]
+    fn backlog_parses_count_and_windows() {
+        assert_eq!("0".parse::<Backlog>(), Ok(Backlog::Off));
+        assert_eq!("0d".parse::<Backlog>(), Ok(Backlog::Off));
+        assert_eq!("50".parse::<Backlog>(), Ok(Backlog::Messages(50)));
+        assert_eq!("24h".parse::<Backlog>(), Ok(Backlog::Seconds(24 * 3600)));
+        assert_eq!("7D".parse::<Backlog>(), Ok(Backlog::Seconds(7 * DAY)));
+        assert!("5m".parse::<Backlog>().is_err());
+        assert!("h".parse::<Backlog>().is_err());
+        assert!("-1".parse::<Backlog>().is_err());
+    }
+
+    async fn store(state: &NodeState, text: &str, origin: Option<(u16, &str)>) -> i64 {
+        state
+            .insert_message(&NewMessage {
+                msg_type: "channel",
+                from_key: None,
+                channel_idx: Some(0),
+                text,
+                timestamp: 0,
+                frame: text.as_bytes(),
+                origin,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replay_skips_own_messages() {
+        let state = open_temp("replay").await;
+        let a = store(&state, "from radio", None).await;
+        let _ = store(&state, "sent by cli", Some((5000, "cli"))).await;
+        let c = store(&state, "sent by app", Some((5000, "app"))).await;
+        let d = store(&state, "cli on other port", Some((5001, "cli"))).await;
+
+        let ids = state.message_ids_after(0, 5000, "cli").await.unwrap();
+        assert_eq!(ids, [a, c, d]);
+        assert_eq!(
+            state.message_frame(c).await.unwrap().unwrap(),
+            b"sent by app"
+        );
+    }
+
+    #[tokio::test]
+    async fn backlog_by_count_and_time() {
+        let state = open_temp("backlog").await;
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(store(&state, &format!("m{i}"), None).await);
+        }
+        sqlx::query("UPDATE messages SET received_at = ?1 WHERE id <= ?2")
+            .bind(chrono::Utc::now().timestamp() - 3 * DAY)
+            .bind(ids[1])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let last_two = state
+            .backlog_message_ids(Backlog::Messages(2), 5000, "x")
+            .await
+            .unwrap();
+        assert_eq!(last_two, ids[2..]);
+        let last_day = state
+            .backlog_message_ids(Backlog::Seconds(DAY), 5000, "x")
+            .await
+            .unwrap();
+        assert_eq!(last_day, ids[2..]);
+        let off = state
+            .backlog_message_ids(Backlog::Off, 5000, "x")
+            .await
+            .unwrap();
+        assert!(off.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_cursor_never_goes_back() {
+        let state = open_temp("cursor").await;
+        assert_eq!(state.client_cursor(5000, "app").await.unwrap(), None);
+        state.advance_client_cursor(5000, "app", 10).await.unwrap();
+        state.advance_client_cursor(5000, "app", 7).await.unwrap();
+        assert_eq!(state.client_cursor(5000, "app").await.unwrap(), Some(10));
+        assert_eq!(state.client_cursor(5001, "app").await.unwrap(), None);
     }
 }
