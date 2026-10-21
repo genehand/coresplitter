@@ -14,6 +14,9 @@ use crate::protocol::decode::{
     DecodedValue, decode_command_payload, decode_response_payload, format_decoded,
 };
 
+/// How long the radio may stay silent on an in-flight request. Measured
+/// from the last frame of the reply, so a long GET_CONTACTS stream over a
+/// slow link (BLE, serial) isn't cut off as long as frames keep coming.
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// Maximum age of a pending_acks entry before it is considered abandoned.
@@ -61,12 +64,15 @@ impl Awaiting {
         match self {
             Awaiting::Any => (!is_push_event(code), true),
             Awaiting::OneOf(codes) => (code == 0x01 || codes.contains(&code), true),
+            // The firmware may refuse to start the stream (GET_CONTACTS
+            // answers ERR/BAD_STATE while an iteration is running); that
+            // ERROR ends the request like the terminator would.
             Awaiting::Stream {
                 frame_codes,
                 terminator_code,
             } => {
-                let in_stream = frame_codes.contains(&code) || code == *terminator_code;
-                (in_stream, code == *terminator_code)
+                let ends = code == *terminator_code || code == 0x01;
+                (ends || frame_codes.contains(&code), ends)
             }
         }
     }
@@ -77,7 +83,8 @@ struct InFlight {
     /// `None` for internal sync commands (sync_from_radio); `Some` for client requests.
     client_id: Option<ClientId>,
     cmd_code: u8,
-    sent_at: Instant,
+    /// When the command was sent or, for streams, the last frame arrived.
+    last_activity: Instant,
     awaiting: Awaiting,
 }
 
@@ -616,7 +623,7 @@ impl Core {
             self.in_flight = Some(InFlight {
                 client_id: next.client_id,
                 cmd_code,
-                sent_at: Instant::now(),
+                last_activity: Instant::now(),
                 awaiting: awaiting_for(&next.payload),
             });
             return Some(());
@@ -763,7 +770,7 @@ impl Core {
         self.in_flight = Some(InFlight {
             client_id,
             cmd_code,
-            sent_at: Instant::now(),
+            last_activity: Instant::now(),
             awaiting: awaiting_for(&payload),
         });
     }
@@ -846,13 +853,13 @@ impl Core {
     }
 
     /// Called on every timeout tick. If the current in_flight has been
-    /// pending longer than IN_FLIGHT_TIMEOUT, fail it with ERROR and
+    /// silent longer than IN_FLIGHT_TIMEOUT, fail it with ERROR and
     /// advance the queue.
     async fn check_in_flight_timeout(&mut self) {
         let timed_out = self
             .in_flight
             .as_ref()
-            .is_some_and(|f| f.sent_at.elapsed() >= IN_FLIGHT_TIMEOUT);
+            .is_some_and(|f| f.last_activity.elapsed() >= IN_FLIGHT_TIMEOUT);
         if !timed_out {
             return;
         }
@@ -1065,6 +1072,8 @@ impl Core {
         if is_terminator {
             self.in_flight = None;
             self.advance_queue().await;
+        } else if let Some(f) = self.in_flight.as_mut() {
+            f.last_activity = Instant::now();
         }
         true
     }
@@ -1409,6 +1418,16 @@ mod tests {
         let remote_telemetry = awaiting_for(&[0x27; 36]);
         assert!(!remote_telemetry.classify(0x8B).0);
         assert!(remote_telemetry.classify(0x06).0);
+    }
+
+    #[test]
+    fn contacts_stream_ends_on_terminator_or_error() {
+        let contacts = awaiting_for(&[0x04]);
+        assert_eq!(contacts.classify(0x02), (true, false));
+        assert_eq!(contacts.classify(0x03), (true, false));
+        assert_eq!(contacts.classify(0x04), (true, true));
+        assert_eq!(contacts.classify(0x01), (true, true));
+        assert!(!contacts.classify(0x83).0);
     }
 
     #[test]
