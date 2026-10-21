@@ -16,7 +16,7 @@ ARG BUILDER=builder
 
 # Base-image versions. Defaults mirror versions.env (the single source of
 # truth); CI overrides them with --build-arg.
-ARG ALPINE_VERSION=3.23
+ARG ALPINE_VERSION=3.24
 ARG RUST_VERSION=1
 
 # ── Stage 1a: compile from source (default local path) ──────────────────────
