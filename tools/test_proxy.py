@@ -123,14 +123,15 @@ class Client:
     async def send_chan_msg(self, channel: int, text: str, ts: int | None = None):
         if ts is None:
             ts = int(time.time())
-        payload = b"\x03" + bytes([channel, 0]) + struct.pack("<I", ts) + text.encode()
+        # [0x03, txt_type, channel_idx, ts(4), text]; the radio replies OK.
+        payload = b"\x03" + bytes([0, channel]) + struct.pack("<I", ts) + text.encode()
         await self.send(payload)
         t0 = time.monotonic()
         while time.monotonic() - t0 < 5:
             p = await self.recv(1)
             if p is None:
                 return None
-            if len(p) and p[0] == 0x06:
+            if len(p) and p[0] == 0x00:
                 return p
         return None
 
@@ -203,8 +204,8 @@ async def test_multi_client(proxy_port):
     # c1 sends SEND_CHAN_MSG to channel 0
     await c1.send_chan_msg(0, "Multi-client test")
 
-    # MSG_SENT is consumed by send_chan_msg's drain loop.
-    ok("c1 sent message (MSG_SENT consumed by drain)")
+    # The radio's OK is consumed by send_chan_msg's drain loop.
+    ok("c1 sent message (OK consumed by drain)")
 
     # c2 should receive a synthesized CHANNEL_MSG_RECV (0x08) via broadcast
     got_broadcast = False

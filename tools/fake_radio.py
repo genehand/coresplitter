@@ -401,7 +401,9 @@ class FakeRadio:
                 await w.drain()
 
             case 0x03:
-                w.write(respond_msg_sent())
+                # Real firmware answers SEND_CHANNEL_TXT_MSG with OK, not
+                # MSG_SENT: channel messages have no ACK to wait for.
+                w.write(respond_ok())
                 await w.drain()
 
             case 0x04:
