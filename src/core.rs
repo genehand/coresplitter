@@ -206,6 +206,25 @@ fn awaiting_for(payload: &[u8]) -> Awaiting {
     }
 }
 
+/// Whether `try_serve_from_cache` can answer this command without the radio.
+///
+/// These are exactly the reads the startup sync is filling, which is what makes
+/// them worth leaving *behind* the sync in `enqueue_or_dispatch` rather than
+/// jumping it: a queued one is normally answered from the freshly warmed cache
+/// without touching the radio at all. Keep in sync with the arms of
+/// `try_serve_from_cache` -- a contacts ask only belongs here while the cache
+/// can answer it.
+fn cache_served_command(cmd_code: u8, cache_contacts: bool) -> bool {
+    match cmd_code {
+        0x04 => cache_contacts, // GET_CONTACTS → contacts table
+        0x01    // APP_START        → SELF_INFO
+        | 0x14  // GET_BATTERY
+        | 0x16  // DEVICE_QUERY    → DEVICE_INFO
+        | 0x1F => true, // GET_CHANNEL
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
     Serial,
@@ -867,12 +886,40 @@ impl Core {
 
     /// Enqueue the command if the radio is busy with a previous request,
     /// otherwise dispatch it immediately.
+    ///
+    /// A client's request jumps ahead of the entries `sync_from_radio` left in
+    /// the queue. That sync is `max_channels` requests long (plus the contacts
+    /// prefetch) and the radio answers one command per loop, so on a slow link
+    /// it occupies the queue for seconds; a command left behind all of it is
+    /// delayed for every one of them, even though none of it is the work the
+    /// client asked for.
+    ///
+    /// The reads `try_serve_from_cache` can answer are the exception, and they
+    /// keep their place. The sync is filling those very cache entries, so a
+    /// queued one is normally answered from the freshly warmed cache without
+    /// touching the radio at all. Jumping ahead instead would re-read from the
+    /// radio what the sync is already reading -- which is what a client walking
+    /// the channel list on connect would then do, doubling the work.
     async fn enqueue_or_dispatch(&mut self, client_id: Option<ClientId>, payload: Vec<u8>) {
         if self.in_flight.is_none() {
             self.dispatch_to_radio(client_id, payload).await;
-        } else {
-            self.pending_queue.push_back(Queued { client_id, payload });
+            return;
         }
+
+        let entry = Queued { client_id, payload };
+        if client_id.is_some()
+            && !cache_served_command(entry.payload[0], self.config.cache_contacts)
+            && let Some(pos) = self
+                .pending_queue
+                .iter()
+                .position(|queued| queued.client_id.is_none())
+        {
+            // Before the first internal entry, but after any client already
+            // queued: clients keep their own arrival order.
+            self.pending_queue.insert(pos, entry);
+            return;
+        }
+        self.pending_queue.push_back(entry);
     }
 
     /// Forward a command to the radio and set up the in_flight slot.
