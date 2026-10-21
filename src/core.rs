@@ -953,7 +953,7 @@ impl Core {
                         max_channels = self.max_channels,
                         "GET_CHANNEL out of range, replying locally"
                     );
-                    self.send_to_client(client_id, vec![0x01, 0x02]);
+                    self.send_to_client(&cmd.client_id, vec![0x01, 0x02]);
                     return true;
                 }
                 if let Ok(channels) = self.state.get_channels().await
@@ -1486,9 +1486,13 @@ impl Core {
         let from_key = &pk[..6];
         let channel = payload[2] as i64;
         let ts = u32::from_le_bytes(payload[3..7].try_into().unwrap_or([0; 4])) as i64;
+        // The radio writes `"<node_name>: "` in front of every channel text it
+        // puts on air (`BaseChatMesh::sendGroupMessage`), and that prefix is the
+        // only sender identity a channel frame carries -- apps recover the
+        // sender from it. Echoing the text bare makes a client read the whole
+        // message as a sender name with an empty body.
         let on_air = channel_text_on_air(self.radio_name.as_deref(), &payload[7..]);
         let text = String::from_utf8_lossy(&on_air).to_string();
-
         let mut fake = Vec::with_capacity(8 + on_air.len());
         fake.push(0x08);
         fake.push(payload[2]); // channel
@@ -1781,9 +1785,19 @@ impl Core {
             let _ = self.broadcast_tx.send(payload);
             return;
         }
-        // 5. A reply nobody is waiting for: typically the late answer to a
-        //    request that already timed out. Handing it to the clients would
-        //    only make them take it as the reply to something else.
+        // 5. A frame carrying network traffic that no request claimed. The
+        //    radio hands those out once (a poll pops them from its offline
+        //    queue), so dropping it would lose the message for every client
+        //    rather than for the one that happened to be waiting. Shape A with
+        //    the sign flipped: what must not happen is one client taking it as
+        //    *its answer*, which the matcher already ruled out.
+        if matches!(resp_code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
+            let _ = self.broadcast_tx.send(payload);
+            return;
+        }
+        // 6. Anything else is the late answer to a request that already timed
+        //    out and whose ghost expired. Handing it to the clients would only
+        //    make them take it as the reply to something else.
         tracing::warn!(
             code = format_args!("0x{resp_code:02x}"),
             "dropping unsolicited radio response"
@@ -1844,10 +1858,14 @@ impl Core {
         }
 
         // An incoming LoRa message delivered as the reply to a GET_MSG is
-        // a global event from the rest of the network's point of view:
-        // every connected client should see it. Fan out to the other
-        // clients (the originator just got it through send_to_client).
-        if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11) {
+        // a global event from the rest of the network's point of view: the
+        // radio only hands it out once (it is popped from the offline
+        // queue), so every other connected client must be given a copy or
+        // it would never see the message at all. The originator already got
+        // it through send_to_client. 0x1B (CHANNEL_DATA_RECV) belongs in this
+        // set for the same reason: it is another 0x0A reply carrying inbound
+        // group traffic.
+        if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
             self.broadcast_to_others(client_id.as_ref(), payload);
         }
 
