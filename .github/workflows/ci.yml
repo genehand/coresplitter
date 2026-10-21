@@ -19,9 +19,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --no-fail-fast
+      - name: Integration tests
+        run: |
+          cargo build
+          uv run pytest tools/test_proxy.py -q
