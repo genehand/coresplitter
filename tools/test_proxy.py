@@ -498,7 +498,7 @@ async def test_send_contact_msg(proxy_port):
 
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
-    log.info("--- Test 12: TCP disconnection + reconnection ---")
+    log.info("--- Test 13: TCP disconnection + reconnection ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -687,7 +687,7 @@ async def test_remove_contact(proxy_port):
 
 
 async def test_rejected_send_not_echoed(proxy_port):
-    log.info("--- Test 11: Rejected send is not echoed ---")
+    log.info("--- Test 12: Rejected send is not echoed ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
     if not await c1.appstart() or not await c2.appstart():
@@ -730,6 +730,77 @@ async def test_rejected_send_not_echoed(proxy_port):
 
     await c1.close()
     await c2.close()
+
+
+async def _get_contacts_raw(c, since=None):
+    """GET_CONTACTS; return (start, [contact frames], end) or None."""
+    payload = b"\x04" if since is None else b"\x04" + struct.pack("<I", since)
+    await c.send(payload)
+    start, frames = None, []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await c.recv(2)
+        if p is None:
+            return None
+        if len(p) == 0:
+            continue
+        if p[0] == 0x02:
+            start = p
+        elif p[0] == 0x03:
+            frames.append(p)
+        elif p[0] == 0x04:
+            return start, frames, p
+    return None
+
+
+async def test_contacts_served_verbatim(proxy_port):
+    log.info("--- Test 11: Cached GET_CONTACTS mirrors the radio ---")
+    c = await connect_client(port=proxy_port)
+    if not await c.appstart():
+        fail("SELF_INFO failed")
+        await c.close()
+        return
+
+    full = await _get_contacts_raw(c)
+    if not full:
+        fail("GET_CONTACTS failed")
+        await c.close()
+        return
+    _, frames, end = full
+    alpha = next((f for f in frames if f[100:132].rstrip(b"\x00") == b"Alpha Test"), None)
+    # flags=1, out_path_len=2, out_path=2a7f, lastmod=1700000100 in fake_radio
+    if (
+        alpha
+        and alpha[34] == 0x01
+        and alpha[35] == 2
+        and alpha[36:38] == bytes([0x2A, 0x7F])
+        and struct.unpack("<I", alpha[144:148])[0] == 1_700_000_100
+    ):
+        ok("cached CONTACT keeps flags, path and lastmod from the radio")
+    else:
+        fail(f"cached CONTACT differs from the radio: {alpha.hex() if alpha else None}")
+
+    # 'since' = Alpha's lastmod: Alpha must be left out, START still
+    # reports the total and END the newest lastmod actually sent.
+    part = await _get_contacts_raw(c, since=1_700_000_100)
+    if not part:
+        fail("GET_CONTACTS(since) failed")
+    else:
+        start, sent, end = part
+        mods = [struct.unpack("<I", f[144:148])[0] for f in sent]
+        total = struct.unpack("<I", start[1:5])[0]
+        last = struct.unpack("<I", end[1:5])[0]
+        if (
+            all(m > 1_700_000_100 for m in mods)
+            and len(sent) < len(frames)
+            and total == len(frames)
+            and last == max(mods, default=0)
+        ):
+            ok("GET_CONTACTS honours 'since' like the firmware")
+        else:
+            fail(f"GET_CONTACTS(since): lastmods={mods} total={total} end={last}")
+
+    await c.close()
 
 
 # --- Harness ---
@@ -824,6 +895,7 @@ async def main():
     await test_send_contact_msg(proxy_port)
     await test_get_msg_fans_out(proxy_port)
     await test_remove_contact(proxy_port)
+    await test_contacts_served_verbatim(proxy_port)
     await test_rejected_send_not_echoed(proxy_port)
     await test_reconnect_tcp(proxy_port)
 

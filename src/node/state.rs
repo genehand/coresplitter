@@ -12,6 +12,10 @@ pub struct CachedContact {
     pub last_advert: Option<i64>,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
+    /// The CONTACT (0x03) frame exactly as the radio sent it, served back
+    /// verbatim so flags, path and lastmod survive. `None` for rows cached
+    /// by older versions, which only kept the decoded fields.
+    pub raw: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -118,6 +122,25 @@ impl NodeState {
         .execute(&self.pool)
         .await?;
 
+        self.add_column_if_missing("contacts", "raw", "BLOB")
+            .await?;
+
+        Ok(())
+    }
+
+    /// SQLite has no ADD COLUMN IF NOT EXISTS; check table_info first.
+    async fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2")
+                .bind(table)
+                .bind(column)
+                .fetch_one(&self.pool)
+                .await?;
+        if !exists {
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
@@ -125,8 +148,8 @@ impl NodeState {
 
     pub async fn upsert_contact(&self, contact: &CachedContact) -> Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO contacts (public_key, name, contact_type, last_advert, lat, lon)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO contacts (public_key, name, contact_type, last_advert, lat, lon, raw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(&contact.public_key)
         .bind(&contact.name)
@@ -134,6 +157,7 @@ impl NodeState {
         .bind(contact.last_advert)
         .bind(contact.lat)
         .bind(contact.lon)
+        .bind(&contact.raw)
         .execute(&self.pool)
         .await?;
         Ok(())

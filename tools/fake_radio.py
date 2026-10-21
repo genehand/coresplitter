@@ -37,6 +37,9 @@ DEFAULT_CONTACTS = [
         "lat": 43.3623,
         "lon": -8.4115,
         "last_advert": 0,
+        "flags": 0x01,
+        "path": bytes([0x2A, 0x7F]),
+        "lastmod": 1_700_000_100,
     },
     {
         "key": bytes.fromhex("1122334455661122334455661122334455661122334455661122334455661122"),
@@ -45,6 +48,9 @@ DEFAULT_CONTACTS = [
         "lat": 43.3700,
         "lon": -8.4200,
         "last_advert": 0,
+        "flags": 0,
+        "path": b"",
+        "lastmod": 1_700_000_200,
     },
 ]
 
@@ -114,31 +120,37 @@ def respond_self_info() -> bytes:
     return encode_response(bytes(payload))
 
 
-def respond_contacts() -> list[bytes]:
+def respond_contacts(since: int = 0) -> list[bytes]:
+    # Same semantics as the firmware: START has the total count, only
+    # contacts with lastmod > since are sent, END has the newest lastmod.
     frames: list[bytes] = []
     n = len(DEFAULT_CONTACTS)
     start = bytearray([0x02])
     start.extend(struct.pack("<I", n))
     frames.append(encode_response(bytes(start)))
 
+    most_recent = 0
     for c in DEFAULT_CONTACTS:
+        if c["lastmod"] <= since:
+            continue
+        most_recent = max(most_recent, c["lastmod"])
         entry = bytearray()
         entry.append(0x03)
         entry.extend(c["key"])
         entry.append(c["type"])
-        entry.append(0)  # flags
-        entry.append(0)  # path_len
-        entry.extend(b"\x00" * 64)  # path
+        entry.append(c["flags"])
+        entry.append(len(c["path"]))
+        entry.extend(c["path"].ljust(64, b"\x00"))
         name_b = c["name"].encode("utf-8")[:32].ljust(32, b"\x00")
         entry.extend(name_b)
         entry.extend(struct.pack("<I", c["last_advert"]))
         entry.extend(struct.pack("<i", int(c["lat"] * 1_000_000)))
         entry.extend(struct.pack("<i", int(c["lon"] * 1_000_000)))
-        entry.extend(b"\x00" * 4)  # last_mod
+        entry.extend(struct.pack("<I", c["lastmod"]))
         frames.append(encode_response(bytes(entry)))
 
     end = bytearray([0x04])
-    end.extend(struct.pack("<I", int(time.time())))
+    end.extend(struct.pack("<I", most_recent))
     frames.append(encode_response(bytes(end)))
     return frames
 
@@ -412,7 +424,8 @@ class FakeRadio:
                 await w.drain()
 
             case 0x04:
-                for frame in respond_contacts():
+                since = struct.unpack("<I", rest[:4])[0] if len(rest) >= 4 else 0
+                for frame in respond_contacts(since):
                     w.write(frame)
                 await w.drain()
 

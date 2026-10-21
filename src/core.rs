@@ -18,6 +18,9 @@ use crate::protocol::decode::{
 /// from the last frame of the reply, so a long GET_CONTACTS stream over a
 /// slow link (BLE, serial) isn't cut off as long as frames keep coming.
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+/// CONTACT frame: code + pubkey(32) + type + flags + out_path_len +
+/// out_path(64) + name(32) + last_advert + lat + lon + lastmod (4 each).
+const CONTACT_FRAME_LEN: usize = 148;
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// Maximum age of a pending_acks entry before it is considered abandoned.
 /// LoRa retransmissions inside the radio top out around ~30 s; five minutes
@@ -694,7 +697,13 @@ impl Core {
                 if let Ok(contacts) = self.state.get_contacts().await
                     && !contacts.is_empty()
                 {
-                    self.respond_contacts(&cmd.client_id, &contacts).await;
+                    // Optional 'since' filter: only contacts modified after it.
+                    let since = cmd
+                        .payload
+                        .get(1..5)
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                    self.respond_contacts(&cmd.client_id, &contacts, since)
+                        .await;
                     return true;
                 }
             }
@@ -941,44 +950,49 @@ impl Core {
         }
     }
 
-    async fn respond_contacts(&self, client_id: &ClientId, contacts: &[CachedContact]) {
+    /// Replay GET_CONTACTS from the cache the way the firmware does it:
+    /// CONTACTS_START carries the total count (not the filtered one),
+    /// only contacts with lastmod > `since` are sent, and END_OF_CONTACTS
+    /// carries the most recent lastmod among those sent.
+    async fn respond_contacts(
+        &self,
+        client_id: &ClientId,
+        contacts: &[CachedContact],
+        since: Option<u32>,
+    ) {
         let count = contacts.len() as u32;
-        let now = chrono::Utc::now().timestamp() as u32;
 
         let mut start = vec![0x02];
         start.extend_from_slice(&u32::to_le_bytes(count));
         self.send_to_client(client_id, start);
 
+        let mut most_recent_lastmod = 0u32;
+        let mut sent = 0usize;
         for contact in contacts {
-            let mut c = vec![0x03];
-            let mut pk_b = [0u8; 32];
-            let pklen = contact.public_key.len().min(32);
-            pk_b[..pklen].copy_from_slice(&contact.public_key[..pklen]);
-            c.extend_from_slice(&pk_b);
-            c.push(contact.contact_type as u8);
-            c.push(0); // flags
-            c.push(0); // path_len
-            c.extend_from_slice(&[0u8; 64]); // path
-            let mut name_b = [0u8; 32];
-            let nlen = contact.name.len().min(32);
-            name_b[..nlen].copy_from_slice(&contact.name.as_bytes()[..nlen]);
-            c.extend_from_slice(&name_b);
-            let last_advert = contact.last_advert.unwrap_or(now as i64) as u32;
-            c.extend_from_slice(&u32::to_le_bytes(last_advert));
-            let lat_i = (contact.lat.unwrap_or(0.0) * 1_000_000.0) as i32;
-            let lon_i = (contact.lon.unwrap_or(0.0) * 1_000_000.0) as i32;
-            c.extend_from_slice(&i32::to_le_bytes(lat_i));
-            c.extend_from_slice(&i32::to_le_bytes(lon_i));
-            c.extend_from_slice(&[0u8; 4]); // last_mod
-
-            self.send_to_client(client_id, c);
+            let frame = match &contact.raw {
+                Some(raw) if raw.len() >= CONTACT_FRAME_LEN => {
+                    let mut f = raw[..CONTACT_FRAME_LEN].to_vec();
+                    f[0] = 0x03;
+                    f
+                }
+                _ => synthesize_contact_frame(contact),
+            };
+            let lastmod = u32::from_le_bytes(frame[144..148].try_into().unwrap());
+            if let Some(since) = since
+                && lastmod <= since
+            {
+                continue;
+            }
+            most_recent_lastmod = most_recent_lastmod.max(lastmod);
+            sent += 1;
+            self.send_to_client(client_id, frame);
         }
 
         let mut end = vec![0x04];
-        end.extend_from_slice(&u32::to_le_bytes(now));
+        end.extend_from_slice(&u32::to_le_bytes(most_recent_lastmod));
         self.send_to_client(client_id, end);
 
-        tracing::debug!(n = count, "responded with cached contacts");
+        tracing::debug!(total = count, sent, "responded with cached contacts");
     }
 
     async fn respond_channel_info(&self, client_id: &ClientId, channel: &CachedChannel) {
@@ -1109,7 +1123,7 @@ impl Core {
 
     async fn cache_response(&mut self, code: u8, payload: &[u8]) {
         match code {
-            0x03 if payload.len() >= 148 => {
+            0x03 if payload.len() >= CONTACT_FRAME_LEN => {
                 let pk = payload[1..33].to_vec();
                 let contact_type = payload[33] as i64;
                 let name_field = &payload[100..132];
@@ -1133,6 +1147,7 @@ impl Core {
                         last_advert: Some(last_advert),
                         lat: if lat != 0.0 { Some(lat) } else { None },
                         lon: if lon != 0.0 { Some(lon) } else { None },
+                        raw: Some(payload[..CONTACT_FRAME_LEN].to_vec()),
                     })
                     .await
                 {
@@ -1384,6 +1399,33 @@ fn build_event_msg(
         let _ = write!(msg, " [{} bytes]: {}", payload.len(), hex::encode(payload));
     }
     sanitize(&msg)
+}
+
+/// Rebuild a CONTACT frame for rows cached before raw frames were kept.
+/// flags, path and lastmod were not stored, so they go out as zero.
+fn synthesize_contact_frame(contact: &CachedContact) -> Vec<u8> {
+    let mut c = Vec::with_capacity(CONTACT_FRAME_LEN);
+    c.push(0x03);
+    let mut pk_b = [0u8; 32];
+    let pklen = contact.public_key.len().min(32);
+    pk_b[..pklen].copy_from_slice(&contact.public_key[..pklen]);
+    c.extend_from_slice(&pk_b);
+    c.push(contact.contact_type as u8);
+    c.push(0); // flags
+    c.push(0); // out_path_len
+    c.extend_from_slice(&[0u8; 64]); // out_path
+    let mut name_b = [0u8; 32];
+    let nlen = contact.name.len().min(32);
+    name_b[..nlen].copy_from_slice(&contact.name.as_bytes()[..nlen]);
+    c.extend_from_slice(&name_b);
+    let last_advert = contact.last_advert.unwrap_or(0) as u32;
+    c.extend_from_slice(&u32::to_le_bytes(last_advert));
+    let lat_i = (contact.lat.unwrap_or(0.0) * 1_000_000.0) as i32;
+    let lon_i = (contact.lon.unwrap_or(0.0) * 1_000_000.0) as i32;
+    c.extend_from_slice(&i32::to_le_bytes(lat_i));
+    c.extend_from_slice(&i32::to_le_bytes(lon_i));
+    c.extend_from_slice(&[0u8; 4]); // lastmod
+    c
 }
 
 fn build_appstart() -> Vec<u8> {
