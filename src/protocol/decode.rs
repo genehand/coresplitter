@@ -17,9 +17,10 @@ pub fn decode_command_payload(code: u8, payload: &[u8]) -> Option<HashMap<String
     let mut map = HashMap::new();
 
     match code {
-        0x01 if payload.len() >= 3 => {
+        // APP_START: [0x01, app_ver, reserved(6), app_name...]
+        0x01 if payload.len() >= 2 => {
             map.insert("version".into(), DecodedValue::Integer(payload[1] as i64));
-            let app = String::from_utf8_lossy(&payload[2..])
+            let app = String::from_utf8_lossy(payload.get(8..).unwrap_or_default())
                 .trim_end_matches('\0')
                 .to_string();
             map.insert("app".into(), DecodedValue::String(app));
