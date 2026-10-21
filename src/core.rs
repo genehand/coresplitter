@@ -132,6 +132,9 @@ pub struct Core {
     command_rx: mpsc::UnboundedReceiver<ClientCommand>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     client_channels: ClientDirectMap,
+    // true while the radio is connected and initialized. The frontend
+    // only listens (and keeps clients connected) while this is true.
+    radio_up_tx: watch::Sender<bool>,
     // The radio handles one command at a time. We serialize: a single
     // request is in flight; further client commands wait in pending_queue.
     in_flight: Option<InFlight>,
@@ -170,6 +173,7 @@ impl Core {
             command_rx,
             broadcast_tx,
             client_channels: Arc::new(Mutex::new(HashMap::new())),
+            radio_up_tx: watch::Sender::new(false),
             in_flight: None,
             pending_queue: VecDeque::new(),
             pending_acks: HashMap::new(),
@@ -191,6 +195,7 @@ impl Core {
             // requests. reconnect_radio() already does this on its own
             // success path, so only the direct-connect branch needs it.
             self.sync_from_radio();
+            self.radio_up_tx.send_replace(true);
         }
 
         // Load persisted blobs from kv_store if not already set (radio offline fallback)
@@ -225,6 +230,7 @@ impl Core {
             self.command_tx.clone(),
             self.broadcast_tx.clone(),
             self.client_channels.clone(),
+            self.radio_up_tx.subscribe(),
             shutdown_rx,
         );
         tokio::spawn(async move {
@@ -355,6 +361,9 @@ impl Core {
 
     async fn reconnect_radio(&mut self) {
         self.radio_send_tx = None;
+        // Close the frontend: without a radio we have nothing honest to
+        // offer, and MeshCore has no "unavailable" frame to say so.
+        self.radio_up_tx.send_replace(false);
 
         // Fail any request that was in flight when the radio dropped.
         if let Some(f) = self.in_flight.take()
@@ -400,6 +409,7 @@ impl Core {
                         Ok(()) => {
                             tracing::info!("radio re-initialized successfully");
                             self.sync_from_radio();
+                            self.radio_up_tx.send_replace(true);
                             return;
                         }
                         Err(e) => {
@@ -573,6 +583,12 @@ impl Core {
 
     async fn handle_client_command(&mut self, cmd: ClientCommand) {
         if cmd.payload.is_empty() {
+            return;
+        }
+
+        // Commands may sit in command_rx while the radio reconnects; by
+        // then their client has been disconnected. Don't act on them.
+        if !self.client_is_alive(&cmd.client_id) {
             return;
         }
 

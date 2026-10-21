@@ -31,7 +31,10 @@ the physical radio — the proxy acts as a **faithful mirror**.
    serialized through a FIFO queue and forwarded one at a time to the
    radio. The radio's reply is routed back to the originating client.
    If the radio disconnects, any in-flight or queued client request is
-   failed immediately with ERROR.
+   failed immediately with ERROR, every client connection is closed and
+   the TCP frontend stops listening until the radio is back. MeshCore
+   has no "device unavailable" frame, so the proxy behaves like an
+   absent node rather than serving a radio it doesn't have.
 4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG): after the radio
    accepts the forward, a synthetic CONTACT_MSG_RECV / CHANNEL_MSG_RECV
    is echoed to the other clients so they see the message as if it
@@ -142,7 +145,7 @@ uv run tools/test_proxy.py
 All tests run sequentially. Each cycle spawns a fresh proxy and fake radio,
 runs the tests, and cleans up.
 
-### Current tests (11 cases, 19 assertions, all PASS)
+### Current tests (11 cases, 21 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -156,7 +159,7 @@ runs the tests, and cleans up.
 | 8 | Contact send (0x02) | Two clients: one sends SEND_MSG, the other receives the raw payload broadcast |
 | 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
 | 10 | REMOVE_CONTACT purges cache | Removes a contact; the next cached GET_CONTACTS no longer lists it |
-| 11 | TCP reconnection | Kills fake radio, waits for reconnect, verifies GET_CHANNEL works |
+| 11 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
 
 ### Fake radio
 
@@ -185,4 +188,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 19/19 PASS (11 cases) on TCP backend against fake radio
+- **Tests**: 21/21 PASS (11 cases) on TCP backend against fake radio

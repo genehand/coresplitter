@@ -515,28 +515,46 @@ async def test_reconnect_tcp(proxy_port):
             fake_proc.kill()
     fake_proc = None
 
-    await asyncio.sleep(4)
-    log.info("  Proxy should be reconnecting...")
+    # With the radio gone the proxy must drop its clients (MeshCore has no
+    # "unavailable" frame) instead of leaving them hanging.
+    closed = False
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await c.recv(1)
+        if p is None:
+            closed = True
+            break
+    if closed:
+        ok("client connection closed when the radio drops")
+    else:
+        fail("client connection still open after the radio dropped")
+    await c.close()
 
-    # Restart fake radio on the same port (proxy still tries to reconnect to old port)
+    # ...and stop listening while it reconnects.
+    try:
+        probe = await connect_client(port=proxy_port)
+        await probe.close()
+        fail("proxy accepted a connection with no radio attached")
+    except (ConnectionRefusedError, OSError):
+        ok("proxy refuses connections while the radio is down")
+
     log.info("  Restarting fake radio...")
     await start_fake(port=fake_port)
     if not fake_proc:
         fail("could not restart fake radio")
-        await c.close()
         return
 
-    # Drain any broadcast messages that arrived during sleep
-    for _ in range(50):
-        p = await c.recv(0.5)
-        if p is None or len(p) == 0:
-            break
+    # Backoff is 1 s, 2 s, 4 s... give the proxy time to come back.
+    if not await wait_for_port(proxy_port, timeout=20):
+        fail("proxy did not reopen the frontend after reconnection")
+        return
 
+    c = await connect_client(port=proxy_port)
     r = await c.get_channel(0)
     if r and r[0] == 0x12:
         ok("proxy reconnected and responds to GET_CHANNEL after reconnection")
     else:
-        fail(f"proxy does not respond after reconnection (r={r}, raw=...)")
+        fail(f"proxy does not respond after reconnection (r={r})")
 
     await c.close()
 
