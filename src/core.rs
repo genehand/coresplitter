@@ -22,20 +22,13 @@ const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// memory growth from channel sends (which never produce an ACK).
 const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 
-/// Response codes that are spontaneous push events from the radio and never
-/// complete an in-flight request. They are always broadcast to every client.
-/// ACK (0x82) is also a push from the in_flight slot's point of view but
-/// has its own dedicated routing via `pending_acks`.
-const PUSH_EVENT_CODES: &[u8] = &[
-    0x80, // ADVERTISEMENT
-    0x81, // PATH_UPDATE
-    0x83, // MESSAGES_WAITING
-    0x88, // LOG_DATA
-    0x8A, // NEW_ADVERT
-];
-
+/// The firmware reserves every code with the high bit set (PUSH_CODE_*,
+/// 0x80..) for spontaneous push events: ADVERT, MSG_WAITING, LOGIN_*,
+/// STATUS_RESPONSE, TRACE_DATA, CONTACT_DELETED, ... They never complete
+/// an in-flight request and are broadcast to every client, except ACK
+/// (0x82), which has its own routing via `pending_acks`.
 fn is_push_event(code: u8) -> bool {
-    PUSH_EVENT_CODES.contains(&code)
+    code >= 0x80
 }
 
 /// What a request is waiting for, to know when to free the slot.
