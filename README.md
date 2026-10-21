@@ -46,8 +46,11 @@ the physical radio — the proxy acts as a **faithful mirror**.
    frame and the proxy fans it out to the rest, so every client sees
    inbound messages even though only one poll consumed it.
 6. Push events from the radio (ADVERTISEMENT, NEW_ADVERT, LOG_DATA,
-   ...) go to everybody. Late LoRa-delivery ACKs (0x82) are routed
-   back to the original sender by `ack_code`.
+   ...) go to everybody. When a push or an accepted command changes a
+   contact on the radio (ADVERTISEMENT, PATH_UPDATE, ADD_UPDATE_CONTACT,
+   RESET_PATH, IMPORT_CONTACT) the proxy queues a re-read of it so the
+   cache keeps serving the radio's current frame. Late LoRa-delivery
+   ACKs (0x82) are routed back to the original sender by `ack_code`.
 
 ## Requirements
 
@@ -146,7 +149,7 @@ uv run tools/test_proxy.py
 All tests run sequentially. Each cycle spawns a fresh proxy and fake radio,
 runs the tests, and cleans up.
 
-### Current tests (13 cases, 25 assertions, all PASS)
+### Current tests (14 cases, 26 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -161,8 +164,9 @@ runs the tests, and cleans up.
 | 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
 | 10 | REMOVE_CONTACT purges cache | Removes a contact; the next cached GET_CONTACTS no longer lists it |
 | 11 | Cached GET_CONTACTS mirrors radio | Cached CONTACT frames keep flags, path and lastmod; the `since` filter, START count and END lastmod follow the firmware |
-| 12 | Rejected send not echoed | SEND_CHAN_MSG to an unknown channel gets ERROR and no echo reaches the other client |
-| 13 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
+| 12 | ADD_UPDATE_CONTACT refreshes cache | After the radio accepts a contact update, the cached list shows its new name, path and lastmod |
+| 13 | Rejected send not echoed | SEND_CHAN_MSG to an unknown channel gets ERROR and no echo reaches the other client |
+| 14 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
 
 ### Fake radio
 
@@ -191,4 +195,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 25/25 PASS (13 cases) on TCP backend against fake radio
+- **Tests**: 26/26 PASS (14 cases) on TCP backend against fake radio

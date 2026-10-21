@@ -120,6 +120,26 @@ def respond_self_info() -> bytes:
     return encode_response(bytes(payload))
 
 
+def contact_frame(c: dict) -> bytes:
+    entry = bytearray()
+    entry.append(0x03)
+    entry.extend(c["key"])
+    entry.append(c["type"])
+    entry.append(c["flags"])
+    entry.append(len(c["path"]))
+    entry.extend(c["path"].ljust(64, b"\x00"))
+    entry.extend(c["name"].encode("utf-8")[:32].ljust(32, b"\x00"))
+    entry.extend(struct.pack("<I", c["last_advert"]))
+    entry.extend(struct.pack("<i", int(c["lat"] * 1_000_000)))
+    entry.extend(struct.pack("<i", int(c["lon"] * 1_000_000)))
+    entry.extend(struct.pack("<I", c["lastmod"]))
+    return encode_response(bytes(entry))
+
+
+def find_contact(key: bytes) -> dict | None:
+    return next((c for c in DEFAULT_CONTACTS if c["key"] == key), None)
+
+
 def respond_contacts(since: int = 0) -> list[bytes]:
     # Same semantics as the firmware: START has the total count, only
     # contacts with lastmod > since are sent, END has the newest lastmod.
@@ -134,20 +154,7 @@ def respond_contacts(since: int = 0) -> list[bytes]:
         if c["lastmod"] <= since:
             continue
         most_recent = max(most_recent, c["lastmod"])
-        entry = bytearray()
-        entry.append(0x03)
-        entry.extend(c["key"])
-        entry.append(c["type"])
-        entry.append(c["flags"])
-        entry.append(len(c["path"]))
-        entry.extend(c["path"].ljust(64, b"\x00"))
-        name_b = c["name"].encode("utf-8")[:32].ljust(32, b"\x00")
-        entry.extend(name_b)
-        entry.extend(struct.pack("<I", c["last_advert"]))
-        entry.extend(struct.pack("<i", int(c["lat"] * 1_000_000)))
-        entry.extend(struct.pack("<i", int(c["lon"] * 1_000_000)))
-        entry.extend(struct.pack("<I", c["lastmod"]))
-        frames.append(encode_response(bytes(entry)))
+        frames.append(contact_frame(c))
 
     end = bytearray([0x04])
     end.extend(struct.pack("<I", most_recent))
@@ -445,6 +452,33 @@ class FakeRadio:
                 w.write(respond_ok())
                 await w.drain()
 
+            case 0x09:
+                # ADD_UPDATE_CONTACT: same layout as a CONTACT frame minus
+                # lastmod, which the radio stamps itself.
+                if len(rest) >= 143:
+                    path_len = rest[34]
+                    c = {
+                        "key": rest[0:32],
+                        "type": rest[32],
+                        "flags": rest[33],
+                        "path": rest[35:35 + min(path_len, 64)],
+                        "name": rest[99:131].rstrip(b"\x00").decode("utf-8", errors="replace"),
+                        "last_advert": struct.unpack("<I", rest[131:135])[0],
+                        "lat": struct.unpack("<i", rest[135:139])[0] / 1_000_000,
+                        "lon": struct.unpack("<i", rest[139:143])[0] / 1_000_000,
+                        "lastmod": int(time.time()),
+                    }
+                    existing = find_contact(c["key"])
+                    if existing:
+                        existing.update(c)
+                    else:
+                        DEFAULT_CONTACTS.append(c)
+                    print(f"     -> Contacto actualizado: {c['name']!r}")
+                    w.write(respond_ok())
+                else:
+                    w.write(respond_error(1))
+                await w.drain()
+
             case 0x0A:
                 msg = self._pop_msg(w)
                 if msg is not None:
@@ -489,6 +523,11 @@ class FakeRadio:
 
             case 0x1A:
                 w.write(respond_login())
+                await w.drain()
+
+            case 0x1E:
+                c = find_contact(rest[:32])
+                w.write(contact_frame(c) if c else respond_error(2))
                 await w.drain()
 
             case 0x1F:
@@ -590,6 +629,7 @@ CMD_NAMES = {
     0x14: "GetBattery",
     0x16: "DeviceQuery",
     0x1A: "SendLogin",
+    0x1E: "GetContactByKey",
     0x1F: "GetChannel",
     0x20: "SetChannel",
     0x25: "SetDevicePin",

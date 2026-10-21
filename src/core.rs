@@ -781,7 +781,21 @@ impl Core {
 
     /// Side effects of a command that only make sense once the radio has
     /// accepted it, i.e. its reply was anything but ERROR.
-    async fn on_command_accepted(&self, client_id: Option<ClientId>, payload: &[u8]) {
+    async fn on_command_accepted(&mut self, client_id: Option<ClientId>, payload: &[u8]) {
+        // Contact table changes: re-read what the radio now holds so the
+        // cache serves the same frame (path, flags, lastmod) it would.
+        match payload[0] {
+            // ADD_UPDATE_CONTACT, RESET_PATH: [cmd, pubkey(32), ...]
+            0x09 | 0x0D if payload.len() >= 33 => self.queue_contact_refresh(&payload[1..33]),
+            // IMPORT_CONTACT takes an advert blob; the key isn't at a fixed
+            // offset, so re-read the whole list.
+            0x12 => self.pending_queue.push_back(Queued {
+                client_id: None,
+                payload: vec![0x04],
+            }),
+            _ => {}
+        }
+
         if let Some(cid) = client_id {
             match payload[0] {
                 0x02 if payload.len() >= 14 => {
@@ -793,6 +807,19 @@ impl Core {
                 _ => {}
             }
         }
+    }
+
+    /// Queue an internal GET_CONTACT_BY_KEY; its CONTACT reply is cached
+    /// by cache_response like any other. Goes to the back of the queue so
+    /// it never jumps ahead of client requests already waiting.
+    fn queue_contact_refresh(&mut self, pubkey: &[u8]) {
+        let mut payload = Vec::with_capacity(33);
+        payload.push(0x1E);
+        payload.extend_from_slice(pubkey);
+        self.pending_queue.push_back(Queued {
+            client_id: None,
+            payload,
+        });
     }
 
     /// Pop and dispatch the next queued command for which the originating
@@ -1038,6 +1065,14 @@ impl Core {
         // 3. A push event from the radio (MESSAGES_WAITING, ADVERTISEMENT,
         //    NEW_ADVERT, ...) goes to everybody.
         if is_push_event(resp_code) {
+            // ADVERT / PATH_UPDATE: [code, pubkey(32)] for a contact the
+            // radio just updated (last_advert, path). Refresh our copy.
+            if matches!(resp_code, 0x80 | 0x81) && payload.len() >= 33 {
+                self.queue_contact_refresh(&payload[1..33]);
+                if self.in_flight.is_none() {
+                    self.advance_queue().await;
+                }
+            }
             let _ = self.broadcast_tx.send(payload);
             return;
         }

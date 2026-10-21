@@ -498,7 +498,7 @@ async def test_send_contact_msg(proxy_port):
 
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
-    log.info("--- Test 13: TCP disconnection + reconnection ---")
+    log.info("--- Test 14: TCP disconnection + reconnection ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -687,7 +687,7 @@ async def test_remove_contact(proxy_port):
 
 
 async def test_rejected_send_not_echoed(proxy_port):
-    log.info("--- Test 12: Rejected send is not echoed ---")
+    log.info("--- Test 13: Rejected send is not echoed ---")
     c1 = await connect_client(port=proxy_port)
     c2 = await connect_client(port=proxy_port)
     if not await c1.appstart() or not await c2.appstart():
@@ -803,6 +803,61 @@ async def test_contacts_served_verbatim(proxy_port):
     await c.close()
 
 
+async def test_update_contact_refreshes_cache(proxy_port):
+    log.info("--- Test 12: ADD_UPDATE_CONTACT refreshes the cache ---")
+    c = await connect_client(port=proxy_port)
+    if not await c.appstart():
+        fail("SELF_INFO failed")
+        await c.close()
+        return
+
+    full = await _get_contacts_raw(c)
+    alpha = next(
+        (f for f in (full[1] if full else []) if f[100:132].rstrip(b"\x00") == b"Alpha Test"),
+        None,
+    )
+    if not alpha:
+        fail("Alpha Test not in cached contacts")
+        await c.close()
+        return
+
+    # Rename Alpha and give it a new path; frame minus code and lastmod.
+    upd = bytearray(alpha[1:144])
+    upd[34] = 1  # out_path_len
+    upd[35:99] = bytes([0x55]).ljust(64, b"\x00")
+    upd[99:131] = b"Alpha Renamed".ljust(32, b"\x00")
+    await c.send(b"\x09" + bytes(upd))
+    reply = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await c.recv(2)
+        if p is None:
+            break
+        if len(p) and p[0] in (0x00, 0x01):
+            reply = p
+            break
+    if not reply or reply[0] != 0x00:
+        fail(f"ADD_UPDATE_CONTACT reply: {reply.hex() if reply else 'None'}")
+        await c.close()
+        return
+
+    # The refresh is a GET_CONTACT_BY_KEY queued after the OK; give it a
+    # moment, then the cached list must carry the radio's new frame.
+    await asyncio.sleep(0.5)
+    full = await _get_contacts_raw(c)
+    renamed = next(
+        (f for f in (full[1] if full else []) if f[100:132].rstrip(b"\x00") == b"Alpha Renamed"),
+        None,
+    )
+    if renamed and renamed[35] == 1 and renamed[36] == 0x55 and renamed[144:148] != alpha[144:148]:
+        ok("cached contact reflects ADD_UPDATE_CONTACT (name, path, lastmod)")
+    else:
+        names = [f[100:132].rstrip(b"\x00").decode() for f in (full[1] if full else [])]
+        fail(f"cache not refreshed after ADD_UPDATE_CONTACT: {names}")
+
+    await c.close()
+
+
 # --- Harness ---
 
 fake_proc = None
@@ -896,6 +951,7 @@ async def main():
     await test_get_msg_fans_out(proxy_port)
     await test_remove_contact(proxy_port)
     await test_contacts_served_verbatim(proxy_port)
+    await test_update_contact_refreshes_cache(proxy_port)
     await test_rejected_send_not_echoed(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
