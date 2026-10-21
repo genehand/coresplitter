@@ -1112,10 +1112,9 @@ impl Core {
             0x03 if payload.len() >= 148 => {
                 let pk = payload[1..33].to_vec();
                 let contact_type = payload[33] as i64;
-                let name = String::from_utf8_lossy(
-                    &payload[100..][..payload[100..].iter().position(|&b| b == 0).unwrap_or(32)],
-                )
-                .to_string();
+                let name_field = &payload[100..132];
+                let name_end = name_field.iter().position(|&b| b == 0).unwrap_or(32);
+                let name = String::from_utf8_lossy(&name_field[..name_end]).to_string();
                 let last_advert =
                     u32::from_le_bytes(payload[132..136].try_into().unwrap_or([0; 4])) as i64;
                 let lat = f64::from(i32::from_le_bytes(
