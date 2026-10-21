@@ -73,6 +73,14 @@ pub struct Cli {
     #[arg(long, env = "CORESPLITTER_LOG_JSON")]
     pub json: bool,
 
+    /// How long to wait for the radio to answer one command before failing it
+    /// with ERROR. This has to cover the radio's own loop stalls, not just the
+    /// round trip: a radio services the companion interface only between its
+    /// radio tasks, so a slow preset or a busy repeater can hold a reply back
+    /// for seconds after the command itself has already run.
+    #[arg(long, default_value_t = 15, env = "CORESPLITTER_IN_FLIGHT_TIMEOUT")]
+    pub in_flight_timeout: u64,
+
     /// Record all raw radio RX payloads into the raw_rx database table
     #[arg(long, env = "CORESPLITTER_RECORD_RADIO_RX")]
     pub record_radio_rx: bool,
@@ -158,6 +166,7 @@ impl Cli {
             event_log_level,
             event_log_json: self.json,
             record_radio_rx: self.record_radio_rx,
+            in_flight_timeout: std::time::Duration::from_secs(self.in_flight_timeout.max(1)),
             cache_contacts: self.cache_contacts,
             retention: Retention {
                 messages_days: self.messages_retention_days,

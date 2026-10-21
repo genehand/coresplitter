@@ -15,14 +15,26 @@ use crate::protocol::decode::{
     DecodedValue, decode_command_payload, decode_response_payload, format_decoded,
 };
 
-/// How long the radio may stay silent on an in-flight request. Measured
-/// from the last frame of the reply, so a long GET_CONTACTS stream over a
-/// slow link (BLE, serial) isn't cut off as long as frames keep coming.
-const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a command whose client already got ERROR is kept as a "ghost",
+/// waiting to swallow the reply the radio still owes it. Long enough to cover
+/// any plausible radio loop stall; short enough that a reply genuinely lost on
+/// the link does not keep eating later commands' answers.
+const GHOST_TTL: Duration = Duration::from_secs(60);
+
+/// Upper bound on outstanding ghosts, so a radio that has stopped answering
+/// altogether cannot make them pile up for a whole TTL.
+const MAX_GHOSTS: usize = 8;
+
+/// A reply slower than this is the radio stalling on something else, not a
+/// round trip. Worth saying out loud: it is the early warning for the stall
+/// that eventually trips the in-flight timeout.
+const SLOW_REPLY_WARN: Duration = Duration::from_secs(1);
+
 /// CONTACT frame: code + pubkey(32) + type + flags + out_path_len +
 /// out_path(64) + name(32) + last_advert + lat + lon + lastmod (4 each).
 const CONTACT_FRAME_LEN: usize = 148;
-const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the database is purged according to the retention settings.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// Maximum age of a pending_acks entry before it is considered abandoned.
@@ -206,6 +218,19 @@ fn awaiting_for(payload: &[u8]) -> Awaiting {
     }
 }
 
+/// A command the proxy gave up on, whose reply has not arrived yet.
+///
+/// The radio answers in order, so an owed reply lands before the reply to any
+/// command sent after it -- which is exactly why it must be accounted for: it
+/// would otherwise be matched against whatever is in flight and handed to a
+/// client that never asked for it.
+#[derive(Debug)]
+struct Ghost {
+    cmd_code: u8,
+    awaiting: Awaiting,
+    since: Instant,
+}
+
 /// Whether `try_serve_from_cache` can answer this command without the radio.
 ///
 /// These are exactly the reads the startup sync is filling, which is what makes
@@ -247,6 +272,9 @@ pub struct CoreConfig {
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
     pub record_radio_rx: bool,
+    /// How long a client request may occupy the in-flight slot before it is
+    /// failed with ERROR. See `--in-flight-timeout`.
+    pub in_flight_timeout: Duration,
     /// Whether a GET_CONTACTS may be answered from the SQLite contact cache.
     /// Off (`--no-contact-cache`) forwards every ask to the radio instead, so
     /// the client always sees the live reply and the proxy keeps no second
@@ -286,6 +314,11 @@ pub struct Core {
     // request is in flight; further client commands wait in pending_queue.
     in_flight: Option<InFlight>,
     pending_queue: VecDeque<Queued>,
+    // Commands whose client already got ERROR, but whose reply the radio still
+    // owes us: it answers in order, so the reply will arrive before that of any
+    // command sent afterwards. Holding them here keeps a late reply from being
+    // handed to the next client as *its* answer (see `try_claim_ghost`).
+    ghosts: VecDeque<Ghost>,
     // Clients waiting for the (possibly much later) LoRa-delivery ACK
     // (0x82), keyed by the 4-byte expected_ack the radio handed back in
     // the corresponding MSG_SENT. The Instant is the insertion time,
@@ -330,6 +363,7 @@ impl Core {
             radio_up_tx: watch::Sender::new(false),
             in_flight: None,
             pending_queue: VecDeque::new(),
+            ghosts: VecDeque::new(),
             pending_acks: HashMap::new(),
             sessions: HashMap::new(),
             protocol_versions: HashMap::new(),
@@ -432,6 +466,7 @@ impl Core {
                 }
                 _ = timeout_tick.tick() => {
                     self.check_in_flight_timeout().await;
+                    self.expire_ghosts();
                 }
                 _ = maintenance_tick.tick() => {
                     self.run_maintenance().await;
@@ -1294,31 +1329,109 @@ impl Core {
     }
 
     /// Called on every timeout tick. If the current in_flight has been
-    /// silent longer than IN_FLIGHT_TIMEOUT, fail it with ERROR and
+    /// silent longer than the configured timeout, fail it with ERROR and
     /// advance the queue.
     async fn check_in_flight_timeout(&mut self) {
         let timed_out = self
             .in_flight
             .as_ref()
-            .is_some_and(|f| f.last_activity.elapsed() >= IN_FLIGHT_TIMEOUT);
+            .is_some_and(|f| f.last_activity.elapsed() >= self.config.in_flight_timeout);
         if !timed_out {
             return;
         }
         let f = self.in_flight.take().expect("checked Some above");
+        let waited_ms = f.last_activity.elapsed().as_millis() as u64;
         if let Some(cid) = f.client_id {
             tracing::warn!(
                 client = %cid,
                 cmd = format_args!("0x{:02x}", f.cmd_code()),
+                waited_ms,
                 "in_flight timeout, replying ERROR"
             );
             self.send_to_client(&cid, vec![0x01, 0x01]);
         } else {
             tracing::warn!(
                 cmd = format_args!("0x{:02x}", f.cmd_code()),
+                waited_ms,
                 "in_flight sync timeout, discarding"
             );
         }
+        self.remember_ghost(f);
         self.advance_queue().await;
+    }
+
+    /// Keep track of the reply the radio still owes a command we just failed.
+    fn remember_ghost(&mut self, f: InFlight) {
+        if self.ghosts.len() >= MAX_GHOSTS {
+            let oldest = self.ghosts.pop_front().expect("non-empty above");
+            tracing::warn!(
+                cmd = format_args!("0x{:02x}", oldest.cmd_code),
+                "too many unanswered timed-out requests; giving up on the oldest"
+            );
+        }
+        self.ghosts.push_back(Ghost {
+            cmd_code: f.cmd_code(),
+            awaiting: f.awaiting,
+            since: Instant::now(),
+        });
+    }
+
+    /// Forget ghosts whose reply never came. Holding one would eat a later
+    /// command's answer instead of the one the radio actually owes.
+    fn expire_ghosts(&mut self) {
+        while self
+            .ghosts
+            .front()
+            .is_some_and(|g| g.since.elapsed() >= GHOST_TTL)
+        {
+            let ghost = self.ghosts.pop_front().expect("checked Some above");
+            tracing::warn!(
+                cmd = format_args!("0x{:02x}", ghost.cmd_code),
+                "no reply ever came for a timed-out request; dropping its ghost"
+            );
+        }
+    }
+
+    /// Consume a frame that answers a command the proxy already failed.
+    ///
+    /// After an in-flight timeout the client has had its ERROR, but the radio
+    /// still owes exactly one reply for that command and answers in order -- so
+    /// the next frame to arrive is that reply, not the answer to whatever
+    /// request is in flight now. Offering it to the live request would hand one
+    /// client another client's answer and then broadcast the displaced reply to
+    /// everybody. The owed reply is dropped instead, loudly, and the live
+    /// request keeps waiting for its own.
+    ///
+    /// Returns true when the frame was accounted for and must not be routed.
+    fn try_claim_ghost(&mut self, code: u8, payload: &[u8]) -> bool {
+        let Some(cmd_code) = self.ghosts.front().map(|g| g.cmd_code) else {
+            return false;
+        };
+        let ghost = self.ghosts.front().expect("checked Some above");
+        let (matched, terminator) = ghost.awaiting.classify(code);
+        if !matched {
+            return false;
+        }
+        let late_ms = ghost.since.elapsed().as_millis() as u64;
+        if terminator {
+            self.ghosts.pop_front();
+        }
+        tracing::warn!(
+            cmd = format_args!("0x{cmd_code:02x}"),
+            reply = format_args!("0x{code:02x}"),
+            len = payload.len(),
+            late_ms,
+            "dropping a reply for a request that already timed out"
+        );
+
+        // A poll that timed out can still have popped an inbound message off
+        // the radio's queue. The radio hands those out once, so dropping it
+        // would lose it for the other clients too: send it down the ordinary
+        // broadcast path instead.
+        if matches!(code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B) {
+            let _ = self.broadcast_tx.send(payload.to_vec());
+        }
+        true
     }
 
     fn protocol_version(&self, client_id: &ClientId) -> u8 {
@@ -1455,16 +1568,22 @@ impl Core {
             let _ = self.state.insert_raw_rx(resp_code, &payload).await;
         }
 
-        // 1. If the frame completes (or belongs to) the in_flight request,
+        // 1. If it answers a request that already timed out, it belongs to
+        //    nobody: the radio answers in order, so it is the owed reply, not
+        //    the answer to whatever is in flight now.
+        if self.try_claim_ghost(resp_code, &payload) {
+            return;
+        }
+        // 2. If the frame completes (or belongs to) the in_flight request,
         //    route it to that client.
         if self.try_route_to_in_flight(resp_code, &payload).await {
             return;
         }
-        // 2. If it's a late ACK matching a previous MSG_SENT, route it.
+        // 3. If it's a late ACK matching a previous MSG_SENT, route it.
         if self.try_route_ack(resp_code, &payload) {
             return;
         }
-        // 3. A push event from the radio (MESSAGES_WAITING, ADVERTISEMENT,
+        // 4. A push event from the radio (MESSAGES_WAITING, ADVERTISEMENT,
         //    NEW_ADVERT, ...) goes to everybody.
         if is_push_event(resp_code) {
             // ADVERT / PATH_UPDATE: [code, pubkey(32)] for a contact the
@@ -1479,7 +1598,7 @@ impl Core {
             let _ = self.broadcast_tx.send(payload);
             return;
         }
-        // 4. A reply nobody is waiting for: typically the late answer to a
+        // 5. A reply nobody is waiting for: typically the late answer to a
         //    request that already timed out. Handing it to the clients would
         //    only make them take it as the reply to something else.
         tracing::warn!(
@@ -1503,6 +1622,23 @@ impl Core {
 
         let client_id = in_flight.client_id;
         let cmd_code = in_flight.cmd_code();
+
+        let elapsed = in_flight.last_activity.elapsed();
+        if elapsed >= SLOW_REPLY_WARN {
+            tracing::warn!(
+                cmd = format_args!("0x{cmd_code:02x}"),
+                reply = format_args!("0x{code:02x}"),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow reply from the radio"
+            );
+        } else {
+            tracing::debug!(
+                cmd = format_args!("0x{cmd_code:02x}"),
+                reply = format_args!("0x{code:02x}"),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "radio replied"
+            );
+        }
 
         if let Some(cid) = client_id {
             // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
