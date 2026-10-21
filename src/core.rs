@@ -1802,11 +1802,14 @@ fn synthesize_contact_frame(contact: &CachedContact) -> Vec<u8> {
     c
 }
 
+/// APP_START: [0x01, app_ver, reserved(6), app_name]; the firmware reads
+/// the name from offset 8.
 fn build_appstart() -> Vec<u8> {
     let app_name = b"coresplitter";
-    let mut payload = Vec::with_capacity(3 + app_name.len());
+    let mut payload = Vec::with_capacity(8 + app_name.len());
     payload.push(0x01);
     payload.push(1);
+    payload.extend_from_slice(&[0; 6]);
     payload.extend_from_slice(app_name);
     payload
 }
