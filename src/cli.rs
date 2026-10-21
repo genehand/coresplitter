@@ -77,6 +77,19 @@ pub struct Cli {
     #[arg(long, env = "CORESPLITTER_RECORD_RADIO_RX")]
     pub record_radio_rx: bool,
 
+    /// Serve GET_CONTACTS from the contact list cached in SQLite.
+    ///
+    /// On by default: the contact table keeps the whole book (frames
+    /// verbatim, refreshed from the radio when it reports a change), so a
+    /// client that syncs repeatedly costs no radio traffic and a repeater
+    /// with hundreds of contacts is dumped once.
+    #[arg(
+        long = "no-contact-cache",
+        action = clap::ArgAction::SetFalse,
+        env = "CORESPLITTER_CACHE_CONTACTS"
+    )]
+    pub cache_contacts: bool,
+
     /// Days to keep stored messages (0 = forever)
     #[arg(
         long,
@@ -145,6 +158,7 @@ impl Cli {
             event_log_level,
             event_log_json: self.json,
             record_radio_rx: self.record_radio_rx,
+            cache_contacts: self.cache_contacts,
             retention: Retention {
                 messages_days: self.messages_retention_days,
                 raw_rx_days: self.raw_rx_retention_days,
