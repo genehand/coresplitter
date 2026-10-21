@@ -173,7 +173,7 @@ pub struct CoreConfig {
     pub tcp_backend_host: Option<String>,
     pub tcp_backend_port: u16,
     pub tcp_frontend_host: String,
-    pub tcp_frontend_port: u16,
+    pub tcp_frontend_ports: Vec<u16>,
     pub data_dir: PathBuf,
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
@@ -292,13 +292,15 @@ impl Core {
             self.battery_info_raw = Some(blob);
         }
 
-        let frontend_addr = format!(
-            "{}:{}",
-            self.config.tcp_frontend_host, self.config.tcp_frontend_port
-        );
+        let frontend_addrs = self
+            .config
+            .tcp_frontend_ports
+            .iter()
+            .map(|port| format!("{}:{port}", self.config.tcp_frontend_host))
+            .collect();
         let shutdown_rx = self.shutdown_rx.clone();
         let mut frontend = TcpFrontend::new(
-            frontend_addr,
+            frontend_addrs,
             self.command_tx.clone(),
             self.broadcast_tx.clone(),
             self.client_channels.clone(),

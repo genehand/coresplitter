@@ -129,7 +129,7 @@ cargo run --release --features ble -- \
 | `CORESPLITTER_TCP_BACKEND_HOST` | Radio TCP host |
 | `CORESPLITTER_TCP_BACKEND_PORT` | Backend TCP port (default: 5000) |
 | `CORESPLITTER_TCP_FRONTEND_HOST` | Frontend TCP bind (default: 0.0.0.0) |
-| `CORESPLITTER_TCP_FRONTEND_PORT` | Frontend TCP port (default: 5000) |
+| `CORESPLITTER_TCP_FRONTEND_PORT` | Frontend TCP port(s), comma separated (default: 5000) |
 | `CORESPLITTER_DATA_DIR` | Data directory (default: ./data) |
 | `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `CORESPLITTER_LOG_JSON` | Enable JSON event logging |

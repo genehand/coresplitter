@@ -49,9 +49,17 @@ pub struct Cli {
     )]
     pub tcp_frontend_host: String,
 
-    /// TCP frontend port
-    #[arg(long, default_value_t = 5000, env = "CORESPLITTER_TCP_FRONTEND_PORT")]
-    pub tcp_frontend_port: u16,
+    /// TCP frontend port(s), comma separated. Clients are told apart by
+    /// port and app name, so a second port lets two copies of the same
+    /// app keep separate message histories.
+    #[arg(
+        long,
+        default_value = "5000",
+        value_delimiter = ',',
+        num_args = 1..,
+        env = "CORESPLITTER_TCP_FRONTEND_PORT"
+    )]
+    pub tcp_frontend_port: Vec<u16>,
 
     /// Data directory for the state database
     #[arg(long, default_value = "./data", env = "CORESPLITTER_DATA_DIR")]
@@ -118,7 +126,7 @@ impl Cli {
             tcp_backend_host: self.tcp_backend_host,
             tcp_backend_port: self.tcp_backend_port,
             tcp_frontend_host: self.tcp_frontend_host,
-            tcp_frontend_port: self.tcp_frontend_port,
+            tcp_frontend_ports: self.tcp_frontend_port,
             data_dir: self.data_dir,
             event_log_level,
             event_log_json: self.json,

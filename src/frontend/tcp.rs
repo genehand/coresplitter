@@ -38,7 +38,7 @@ pub struct ClientCommand {
 pub type ClientDirectMap = Arc<Mutex<HashMap<ClientId, mpsc::UnboundedSender<Vec<u8>>>>>;
 
 pub struct TcpFrontend {
-    bind_addr: String,
+    bind_addrs: Vec<String>,
     command_tx: mpsc::UnboundedSender<ClientCommand>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     direct_map: ClientDirectMap,
@@ -52,7 +52,7 @@ pub struct TcpFrontend {
 
 impl TcpFrontend {
     pub fn new(
-        bind_addr: String,
+        bind_addrs: Vec<String>,
         command_tx: mpsc::UnboundedSender<ClientCommand>,
         broadcast_tx: broadcast::Sender<Vec<u8>>,
         direct_map: ClientDirectMap,
@@ -60,7 +60,7 @@ impl TcpFrontend {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         Self {
-            bind_addr,
+            bind_addrs,
             command_tx,
             broadcast_tx,
             direct_map,
@@ -84,22 +84,20 @@ impl TcpFrontend {
                 }
             }
 
-            let listener = match TcpListener::bind(&self.bind_addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(addr = %self.bind_addr, error = %e, "TCP frontend bind failed, retrying");
-                    tokio::time::sleep(BIND_RETRY_DELAY).await;
-                    continue;
-                }
+            let Some(listeners) = self.bind_all().await else {
+                tokio::time::sleep(BIND_RETRY_DELAY).await;
+                continue;
             };
-            tracing::info!(addr = %self.bind_addr, "TCP frontend listening");
 
             // Separate receiver: the select arm below borrows it mutably
             // while the accept arm clones self.radio_up_rx for each client.
             let mut down_rx = self.radio_up_rx.clone();
             loop {
+                // Accept on whichever listener gets a connection first.
+                let accept_any =
+                    futures::future::select_all(listeners.iter().map(|l| Box::pin(l.accept())));
                 tokio::select! {
-                    result = listener.accept() => {
+                    (result, _, _) = accept_any => {
                         let (stream, addr) = match result {
                             Ok(conn) => conn,
                             Err(e) => {
@@ -132,6 +130,25 @@ impl TcpFrontend {
                 }
             }
         }
+    }
+
+    /// Bind every configured address, or none: a partial frontend would
+    /// silently leave the clients of the failed port without service.
+    async fn bind_all(&self) -> Option<Vec<TcpListener>> {
+        let mut listeners = Vec::with_capacity(self.bind_addrs.len());
+        for addr in &self.bind_addrs {
+            match TcpListener::bind(addr).await {
+                Ok(l) => {
+                    tracing::info!(addr = %addr, "TCP frontend listening");
+                    listeners.push(l);
+                }
+                Err(e) => {
+                    tracing::error!(addr = %addr, error = %e, "TCP frontend bind failed, retrying");
+                    return None;
+                }
+            }
+        }
+        Some(listeners)
     }
 }
 
