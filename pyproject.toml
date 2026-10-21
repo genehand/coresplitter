@@ -1,0 +1,22 @@
+[project]
+name = "coresplitter-tools"
+version = "0.0.0"
+description = "Python test tooling for coresplitter (integration suite + fake radio)"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+# The integration tests are one long asyncio session against a single fake
+# radio and proxy, so fixtures and tests must share one event loop.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+# Only the integration suite is a pytest suite; the other tools/test_*.py files
+# are ad-hoc probes against a real radio and are collected only if named
+# explicitly.
+testpaths = ["tools/test_proxy.py"]
