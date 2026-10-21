@@ -339,6 +339,15 @@ pub struct Core {
     // closes login/status/telemetry requests, which never produce an
     // ACK, so without eviction those entries would accumulate forever.
     pending_acks: HashMap<[u8; 4], (ClientId, Instant)>,
+    // Payloads of the SEND_* commands already echoed, so a resend is echoed --
+    // and stored -- only once. A resend is not a new message: the client reuses
+    // the timestamp, which is what makes the two commands the *same* on-air
+    // packet, and the firmware drops the duplicate in its `wasSeen` table
+    // before any companion interface sees it. Bounded and byte-compared rather
+    // than hashed: the payload carries the sender's timestamp, so an identical
+    // payload can only be a retransmission (the size matches the firmware's own
+    // dup table, `MAX_PACKET_HASHES`).
+    recent_echoes: VecDeque<Vec<u8>>,
     // Identified clients, keyed by connection. Entries of disconnected
     // clients are dropped lazily (see follow_head).
     sessions: HashMap<ClientId, Session>,
@@ -378,6 +387,7 @@ impl Core {
             pending_queue: VecDeque::new(),
             ghosts: VecDeque::new(),
             pending_acks: HashMap::new(),
+            recent_echoes: VecDeque::new(),
             sessions: HashMap::new(),
             protocol_versions: HashMap::new(),
         })
@@ -1346,6 +1356,27 @@ impl Core {
         self.client_channels.lock().unwrap().contains_key(client_id)
     }
 
+    /// Whether this send has already been echoed; records it if not.
+    ///
+    /// A client retrying a send reuses the timestamp, which is what makes the
+    /// two commands the same on-air packet: `BaseChatMesh::sendGroupMessage`
+    /// mixes it into the payload precisely so a retransmission is
+    /// recognisable, and the firmware's `wasSeen` table drops the copy before
+    /// any companion interface is reached. A second echo would be a frame no
+    /// radio would ever have emitted, and one stored row per attempt hands the
+    /// message to every reconnecting client twice.
+    fn seen_send_before(&mut self, payload: &[u8]) -> bool {
+        if self.recent_echoes.iter().any(|p| p.as_slice() == payload) {
+            return true;
+        }
+        const MAX_RECENT_ECHOES: usize = 160;
+        if self.recent_echoes.len() == MAX_RECENT_ECHOES {
+            self.recent_echoes.pop_front();
+        }
+        self.recent_echoes.push_back(payload.to_vec());
+        false
+    }
+
     /// Synthesize a CONTACT_MSG_RECV (0x07) for the rest of the clients so
     /// they see this message as if it had arrived over LoRa from the radio.
     async fn synthesize_contact_echo(
@@ -1354,6 +1385,13 @@ impl Core {
         origin: Option<&(u16, String)>,
         payload: &[u8],
     ) {
+        if self.seen_send_before(payload) {
+            tracing::debug!(
+                client = %sender,
+                "suppressing the echo of a resent message"
+            );
+            return;
+        }
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_MSG");
             return;
@@ -1392,6 +1430,13 @@ impl Core {
         origin: Option<&(u16, String)>,
         payload: &[u8],
     ) {
+        if self.seen_send_before(payload) {
+            tracing::debug!(
+                client = %sender,
+                "suppressing the echo of a resent channel message"
+            );
+            return;
+        }
         let Some(pk) = self.radio_pubkey else {
             tracing::warn!("no radio pubkey known, skipping synthetic broadcast for SEND_CHAN_MSG");
             return;
