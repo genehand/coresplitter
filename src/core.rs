@@ -186,10 +186,12 @@ impl Core {
             tracing::warn!(error = %e, "initial radio initialization failed, will retry");
             self.radio_send_tx = None;
             self.reconnect_radio().await;
+        } else {
+            // Queue sync commands so they serialize with any early client
+            // requests. reconnect_radio() already does this on its own
+            // success path, so only the direct-connect branch needs it.
+            self.sync_from_radio();
         }
-
-        // Queue sync commands so they serialize with any early client requests.
-        self.sync_from_radio();
 
         // Load persisted blobs from kv_store if not already set (radio offline fallback)
         if self.self_info_raw.is_none()
