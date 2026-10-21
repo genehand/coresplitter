@@ -81,6 +81,17 @@ pub struct Cli {
     #[arg(long, default_value_t = 15, env = "CORESPLITTER_IN_FLIGHT_TIMEOUT")]
     pub in_flight_timeout: u64,
 
+    /// Close a client connection that has sent nothing for this many seconds.
+    ///
+    /// A companion client talks just to keep the link honest: it polls
+    /// battery every 120 s and message sync whenever the UI asks. Silence for
+    /// far longer than that means the client is gone, not quiet -- most often
+    /// a suspended phone whose OS never sent a FIN, so the frontend would
+    /// otherwise keep serving a half-open socket and every reconnect would
+    /// stack another "live" client on the same identity. 0 disables the sweep.
+    #[arg(long, default_value_t = 600, env = "CORESPLITTER_CLIENT_IDLE_TIMEOUT")]
+    pub client_idle_timeout: u64,
+
     /// Record all raw radio RX payloads into the raw_rx database table
     #[arg(long, env = "CORESPLITTER_RECORD_RADIO_RX")]
     pub record_radio_rx: bool,
@@ -167,6 +178,7 @@ impl Cli {
             event_log_json: self.json,
             record_radio_rx: self.record_radio_rx,
             in_flight_timeout: std::time::Duration::from_secs(self.in_flight_timeout.max(1)),
+            client_idle_timeout: std::time::Duration::from_secs(self.client_idle_timeout),
             cache_contacts: self.cache_contacts,
             retention: Retention {
                 messages_days: self.messages_retention_days,
