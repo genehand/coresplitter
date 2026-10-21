@@ -51,6 +51,8 @@ pub struct TcpFrontend {
     // client connection is closed.
     radio_up_rx: watch::Receiver<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Close a client that has sent nothing for this long; zero disables it.
+    client_idle_timeout: Duration,
 }
 
 impl TcpFrontend {
@@ -61,6 +63,7 @@ impl TcpFrontend {
         direct_map: ClientDirectMap,
         radio_up_rx: watch::Receiver<bool>,
         shutdown_rx: watch::Receiver<bool>,
+        client_idle_timeout: Duration,
     ) -> Self {
         Self {
             bind_addrs,
@@ -69,6 +72,7 @@ impl TcpFrontend {
             direct_map,
             radio_up_rx,
             shutdown_rx,
+            client_idle_timeout,
         }
     }
 
@@ -112,6 +116,7 @@ impl TcpFrontend {
                         let broadcast_rx = self.broadcast_tx.subscribe();
                         let direct_map = self.direct_map.clone();
                         let radio_up_rx = self.radio_up_rx.clone();
+                        let client_idle_timeout = self.client_idle_timeout;
                         tracing::info!(addr = %addr, "spawning client handler");
                         tokio::spawn(handle_client(
                             stream,
@@ -120,6 +125,7 @@ impl TcpFrontend {
                             broadcast_rx,
                             direct_map,
                             radio_up_rx,
+                            client_idle_timeout,
                         ));
                     }
                     _ = down_rx.wait_for(|up| !*up) => {
@@ -162,6 +168,7 @@ async fn handle_client(
     mut broadcast_rx: broadcast::Receiver<Vec<u8>>,
     direct_map: ClientDirectMap,
     mut radio_up_rx: watch::Receiver<bool>,
+    client_idle_timeout: Duration,
 ) {
     let client_id = ClientId::new();
     tracing::info!(client = %client_id, addr = %addr, "client connected");
@@ -179,7 +186,32 @@ async fn handle_client(
         let mut buf = vec![0u8; 4096];
 
         loop {
-            match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
+            // A companion client polls (battery every 120 s, message sync on
+            // demand), so a socket that has said nothing for the idle timeout
+            // is gone even though no FIN ever arrived. Only reads are timed: a
+            // client is idle when it stops *sending*.
+            let read = if client_idle_timeout.is_zero() {
+                tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await
+            } else {
+                match tokio::time::timeout(
+                    client_idle_timeout,
+                    tokio::io::AsyncReadExt::read(&mut reader, &mut buf),
+                )
+                .await
+                {
+                    Ok(read) => read,
+                    Err(_) => {
+                        tracing::info!(
+                            client = %client_id,
+                            addr = %addr,
+                            timeout_secs = client_idle_timeout.as_secs(),
+                            "client idle timeout, closing connection"
+                        );
+                        break;
+                    }
+                }
+            };
+            match read {
                 Ok(0) => break,
                 Ok(n) => {
                     let frames = parser.feed(&buf[..n]);
