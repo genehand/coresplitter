@@ -67,7 +67,11 @@ the physical radio — the proxy acts as a **faithful mirror**.
 ## Requirements
 
 - **Rust edition 2024** (requires Rust ≥ 1.85)
-- **Linux** (single target)
+- **Linux** (primary target)
+- **macOS**: reported working with the serial backend on macOS 26.5
+  (rustc 1.95.0) without code changes; see
+  [#1](https://github.com/ogarcia/coresplitter/issues/1). Not tested
+  in CI.
 
 ## Build
 
