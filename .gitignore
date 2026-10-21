@@ -1,3 +1,9 @@
+
 /target
 /data
 /artifacts
+
+# Python tooling (pytest suite + fake radio)
+.venv/
+__pycache__/
+.pytest_cache/
