@@ -631,6 +631,65 @@ async def test_get_msg_fans_out(proxy_port):
     await c2.close()
 
 
+async def test_message_layout_per_version(proxy_port):
+    log.info("--- Test 18: Message frames follow each client's protocol version ---")
+    old = await connect_client(port=proxy_port)
+    new = await connect_client(port=proxy_port)
+    if not await old.appstart() or not await new.appstart():
+        fail("SELF_INFO failed for one or both clients")
+        await old.close()
+        await new.close()
+        return
+
+    # DEVICE_QUERY carries the version the app understands; the proxy
+    # answers it but must not hand it on to the radio.
+    for c, version in ((old, 1), (new, 3)):
+        await c.send(bytes([0x16, version]))
+        p = await c.recv(5)
+        if not p or p[0] != 0x0D:
+            fail(f"DEVICE_QUERY v{version} returned: {p.hex() if p else 'None'}")
+
+    if not await _wait_for_0x83(new, 10):
+        fail("v3 client did not receive MESSAGES_WAITING (0x83) in 10s")
+        await old.close()
+        await new.close()
+        return
+
+    await new.send(b"\x0A")
+    v3 = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await new.recv(1)
+        if p is None:
+            break
+        if len(p) and p[0] in (0x07, 0x08, 0x10, 0x11):
+            v3 = p
+            break
+    if not v3 or v3[0] not in (0x10, 0x11):
+        fail(f"v3 client GET_MSG returned: {v3.hex() if v3 else 'None'}")
+        await old.close()
+        await new.close()
+        return
+    ok(f"v3 client gets 0x{v3[0]:02x}")
+
+    v1 = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await old.recv(1)
+        if p is None:
+            break
+        if len(p) and p[0] in (0x07, 0x08, 0x10, 0x11):
+            v1 = p
+            break
+    if v1 == bytes([v3[0] - 0x09]) + v3[4:]:
+        ok(f"v1 client gets the same message as 0x{v1[0]:02x}")
+    else:
+        fail(f"v1 client got {v1.hex() if v1 else 'None'} for {v3.hex()}")
+
+    await old.close()
+    await new.close()
+
+
 async def _get_contact_names(c):
     """GET_CONTACTS and return the names in the stream, or None on failure."""
     await c.send(b"\x04")
@@ -1065,6 +1124,7 @@ async def main():
     await test_missed_messages_replayed(proxy_port)
     await test_own_messages_not_replayed(proxy_port)
     await test_same_app_two_ports(proxy_port, proxy_port2)
+    await test_message_layout_per_version(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL

@@ -24,6 +24,7 @@ import tty
 
 HOST = "0.0.0.0"
 PORT = 5050
+MAX_CHANNELS = 40  # advertised in DEVICE_INFO, as MAX_GROUP_CHANNELS
 
 # ---------------------------------------------------------------------------
 # Default test data
@@ -167,7 +168,7 @@ def respond_device_info() -> bytes:
     payload.append(0x0D)
     payload.append(11)
     payload.append(175)
-    payload.append(40)
+    payload.append(MAX_CHANNELS)
     payload.extend(b"\x00" * 4)
     payload.extend(b"19 Apr 2026\x00\x00\x00\x00\x00")
     payload.extend(b"Heltec V3\x00" + b"\x00" * 30)
@@ -212,9 +213,9 @@ def respond_login() -> bytes:
     return encode_response(b"\x85")
 
 
-def make_chan_msg(channel: int, text: str) -> bytes:
-    payload = bytearray()
-    payload.append(0x08)
+def make_chan_msg(channel: int, text: str, v3: bool = False) -> bytes:
+    # From protocol v3 on: CHANNEL_MSG_RECV_V3 (0x11) + snr + 2 reserved.
+    payload = bytearray([0x11, 0x2F, 0, 0] if v3 else [0x08])
     payload.append(channel)
     payload.append(0)
     payload.append(0)
@@ -259,9 +260,9 @@ class SerialWriter:
 # Fake Radio
 # ---------------------------------------------------------------------------
 
-def make_contact_msg(from_key: bytes, text: str) -> bytes:
-    payload = bytearray()
-    payload.append(0x07)
+def make_contact_msg(from_key: bytes, text: str, v3: bool = False) -> bytes:
+    # From protocol v3 on: CONTACT_MSG_RECV_V3 (0x10) + snr + 2 reserved.
+    payload = bytearray([0x10, 0x2F, 0, 0] if v3 else [0x07])
     payload.extend(from_key[:6].ljust(6, b"\x00"))
     payload.append(0)
     payload.append(1)
@@ -278,6 +279,9 @@ class FakeRadio:
     def __init__(self, inject: bool = False):
         self.channels: list[dict] = list(DEFAULT_CHANNELS)
         self.inject = inject
+        # Set by DEVICE_QUERY; picks the layout of queued messages, as in
+        # the firmware (app_target_ver).
+        self.app_target_ver = 0
         # Per-writer message queues (writer fd/id → list of framed messages)
         self._msg_queues: dict[int, list[bytes]] = {}
         self._next_queue_id = 0
@@ -518,6 +522,8 @@ class FakeRadio:
                 await w.drain()
 
             case 0x16:
+                if rest:
+                    self.app_target_ver = rest[0]
                 w.write(respond_device_info())
                 await w.drain()
 
@@ -533,7 +539,9 @@ class FakeRadio:
             case 0x1F:
                 idx = rest[0] if rest else 0
                 ch = next((c for c in self.channels if c["idx"] == idx), None)
-                if ch:
+                if idx >= MAX_CHANNELS:
+                    w.write(respond_error(2))  # ERR_CODE_NOT_FOUND
+                elif ch:
                     w.write(respond_channel_info(idx, ch["name"], ch["psk"]))
                 else:
                     w.write(respond_channel_info(idx, ""))
@@ -575,12 +583,12 @@ class FakeRadio:
         # (0x83). The client is expected to retrieve it via GET_MSG (0x0A).
         # No direct push of the 0x07/0x08 frame, which a real radio does
         # not do either.
-        items: list[bytes] = [
-            make_chan_msg(0, "Keep alive from fake radio"),
-            make_contact_msg(b"\xAA\xBB\xCC\xDD\xEE\xFF", "Hello from Alpha"),
-            make_chan_msg(0, "Test message on Public"),
-            make_chan_msg(0, "Alerta: temperatura alta"),
-            make_chan_msg(0, "A" * 200),
+        items = [
+            lambda v3: make_chan_msg(0, "Keep alive from fake radio", v3),
+            lambda v3: make_contact_msg(b"\xAA\xBB\xCC\xDD\xEE\xFF", "Hello from Alpha", v3),
+            lambda v3: make_chan_msg(0, "Test message on Public", v3),
+            lambda v3: make_chan_msg(0, "Alerta: temperatura alta", v3),
+            lambda v3: make_chan_msg(0, "A" * 200, v3),
         ]
         try:
             n = 0
@@ -588,7 +596,7 @@ class FakeRadio:
                 await asyncio.sleep(6)
                 if n >= len(items):
                     n = 0
-                framed = items[n]
+                framed = items[n](self.app_target_ver >= 3)
                 self._push_msg(w, framed)
                 w.write(make_messages_waiting())
                 await w.drain()

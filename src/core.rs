@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,11 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// is comfortably above any realistic real ACK and short enough to bound
 /// memory growth from channel sends (which never produce an ACK).
 const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
+/// Companion protocol version the proxy negotiates with the radio. The
+/// radio picks the layout of a received message when it queues it, from
+/// the last DEVICE_QUERY it got, so it must not follow each client's: v3
+/// keeps the SNR, and older clients get the frame converted back.
+const RADIO_PROTOCOL_VERSION: u8 = 3;
 
 /// The firmware reserves every code with the high bit set (PUSH_CODE_*,
 /// 0x80..) for spontaneous push events: ADVERT, MSG_WAITING, LOGIN_*,
@@ -37,6 +43,22 @@ const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 /// (0x82), which has its own routing via `pending_acks`.
 fn is_push_event(code: u8) -> bool {
     code >= 0x80
+}
+
+/// From v3 on, CONTACT_MSG_RECV and CHANNEL_MSG_RECV (0x07/0x08) become
+/// 0x10/0x11 and carry SNR plus two reserved bytes right after the code.
+/// Hand a message frame over in the layout the client negotiated; any
+/// other frame goes through untouched. A v1 frame upgraded to v3 has no
+/// SNR to report and gets 0.
+fn message_frame_for(version: u8, frame: &[u8]) -> Cow<'_, [u8]> {
+    let converted = match (frame.first(), version >= 3) {
+        (Some(&code @ (0x10 | 0x11)), false) if frame.len() >= 4 => {
+            [&[code - 0x09][..], &frame[4..]].concat()
+        }
+        (Some(&code @ (0x07 | 0x08)), true) => [&[code + 0x09, 0, 0, 0][..], &frame[1..]].concat(),
+        _ => return Cow::Borrowed(frame),
+    };
+    Cow::Owned(converted)
 }
 
 /// What a request is waiting for, to know when to free the slot.
@@ -236,6 +258,10 @@ pub struct Core {
     // Identified clients, keyed by connection. Entries of disconnected
     // clients are dropped lazily (see follow_head).
     sessions: HashMap<ClientId, Session>,
+    // Protocol version each client asked for in DEVICE_QUERY; clients that
+    // never sent one are taken as v0, like the firmware does. Dropped
+    // lazily along with `sessions`.
+    protocol_versions: HashMap<ClientId, u8>,
 }
 
 impl Core {
@@ -268,6 +294,7 @@ impl Core {
             pending_queue: VecDeque::new(),
             pending_acks: HashMap::new(),
             sessions: HashMap::new(),
+            protocol_versions: HashMap::new(),
         })
     }
 
@@ -562,7 +589,7 @@ impl Core {
         self.wait_for_self_info().await?;
 
         // Query device info to learn radio capabilities (max_channels, etc.)
-        let device_query = vec![0x16];
+        let device_query = vec![0x16, RADIO_PROTOCOL_VERSION];
         self.send_to_radio(&device_query).await?;
 
         self.wait_for_device_info().await?;
@@ -726,6 +753,11 @@ impl Core {
         if cmd_code == 0x01 {
             self.register_session(&cmd).await;
         }
+        if cmd_code == 0x16
+            && let Some(&version) = cmd.payload.get(1)
+        {
+            self.protocol_versions.insert(cmd.client_id, version);
+        }
         // Messages missed while offline are served before asking the radio.
         if cmd_code == 0x0A && self.replay_next_missed(&cmd.client_id).await {
             return;
@@ -739,9 +771,14 @@ impl Core {
             return;
         }
 
-        // 2. Anything else goes through the serialized radio queue.
-        self.enqueue_or_dispatch(Some(cmd.client_id), cmd.payload)
-            .await;
+        // 2. Anything else goes through the serialized radio queue. A
+        //    DEVICE_QUERY that reaches the radio keeps the proxy's version.
+        let payload = if cmd_code == 0x16 {
+            vec![0x16, RADIO_PROTOCOL_VERSION]
+        } else {
+            cmd.payload
+        };
+        self.enqueue_or_dispatch(Some(cmd.client_id), payload).await;
     }
 
     /// Returns true if the command was fully served from cache without
@@ -1068,6 +1105,8 @@ impl Core {
         let mut identities: Vec<(u16, String)> = {
             let channels = self.client_channels.lock().unwrap();
             self.sessions.retain(|cid, _| channels.contains_key(cid));
+            self.protocol_versions
+                .retain(|cid, _| channels.contains_key(cid));
             self.sessions
                 .values()
                 .filter(|s| s.pending.is_empty())
@@ -1192,9 +1231,17 @@ impl Core {
         self.advance_queue().await;
     }
 
+    fn protocol_version(&self, client_id: &ClientId) -> u8 {
+        self.protocol_versions.get(client_id).copied().unwrap_or(0)
+    }
+
     fn send_to_client(&self, client_id: &ClientId, payload: Vec<u8>) {
         let client_tx = self.client_channels.lock().unwrap().get(client_id).cloned();
         if let Some(tx) = client_tx {
+            let payload = match message_frame_for(self.protocol_version(client_id), &payload) {
+                Cow::Borrowed(_) => payload,
+                Cow::Owned(converted) => converted,
+            };
             let _ = tx.send(payload);
         }
     }
@@ -1207,7 +1254,7 @@ impl Core {
             {
                 continue;
             }
-            let _ = tx.send(payload.to_vec());
+            let _ = tx.send(message_frame_for(self.protocol_version(id), payload).into_owned());
         }
     }
 
@@ -1818,5 +1865,28 @@ mod tests {
         let unknown = awaiting_for(&[0x7E]);
         assert!(unknown.classify(0x2A).0);
         assert!(!unknown.classify(0x83).0);
+    }
+
+    #[test]
+    fn message_frames_follow_client_version() {
+        // CHANNEL_MSG_RECV_V3: snr, 2 reserved, channel, path_len, txt_type, ts, text
+        let v3 = [0x11, 0x2F, 0, 0, 1, 6, 0, 1, 2, 3, 4, b'h', b'i'];
+        let v1 = [0x08, 1, 6, 0, 1, 2, 3, 4, b'h', b'i'];
+        assert_eq!(&*message_frame_for(0, &v3), &v1);
+        assert_eq!(&*message_frame_for(3, &v3), &v3);
+        assert_eq!(&*message_frame_for(1, &v1), &v1);
+        let upgraded = message_frame_for(3, &v1);
+        assert_eq!(upgraded[..4], [0x11, 0, 0, 0]);
+        assert_eq!(upgraded[4..], v3[4..]);
+
+        // CONTACT_MSG_RECV_V3 → CONTACT_MSG_RECV
+        let v3 = [
+            0x10, 0x10, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0, 0, 1, 2, 3, 4,
+        ];
+        assert_eq!(message_frame_for(0, &v3)[..2], [0x07, 0xAA]);
+
+        // Anything else is left alone.
+        assert_eq!(&*message_frame_for(0, &[0x12, 1, 2]), &[0x12, 1, 2]);
+        assert_eq!(&*message_frame_for(3, &[0x83]), &[0x83]);
     }
 }
