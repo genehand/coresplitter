@@ -35,11 +35,12 @@ the physical radio — the proxy acts as a **faithful mirror**.
    the TCP frontend stops listening until the radio is back. MeshCore
    has no "device unavailable" frame, so the proxy behaves like an
    absent node rather than serving a radio it doesn't have.
-4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG): after the radio
-   accepts the forward, a synthetic CONTACT_MSG_RECV / CHANNEL_MSG_RECV
-   is echoed to the other clients so they see the message as if it
-   had arrived over LoRa. If the radio is unreachable the originator
-   gets an ERROR and nothing is echoed or persisted.
+4. Outgoing messages (SEND_MSG, SEND_CHAN_MSG): once the radio accepts
+   the message (MSG_SENT for SEND_MSG, OK for SEND_CHAN_MSG), a
+   synthetic CONTACT_MSG_RECV / CHANNEL_MSG_RECV is echoed to the other
+   clients so they see the message as if it had arrived over LoRa. If
+   the radio rejects it or is unreachable, the originator gets the
+   ERROR and nothing is echoed or persisted.
 5. Incoming LoRa traffic: the radio pushes MESSAGES_WAITING (0x83) to
    every client; the first one to poll with GET_MSG retrieves the
    frame and the proxy fans it out to the rest, so every client sees
@@ -145,7 +146,7 @@ uv run tools/test_proxy.py
 All tests run sequentially. Each cycle spawns a fresh proxy and fake radio,
 runs the tests, and cleans up.
 
-### Current tests (11 cases, 21 assertions, all PASS)
+### Current tests (12 cases, 23 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -159,7 +160,8 @@ runs the tests, and cleans up.
 | 8 | Contact send (0x02) | Two clients: one sends SEND_MSG, the other receives the raw payload broadcast |
 | 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
 | 10 | REMOVE_CONTACT purges cache | Removes a contact; the next cached GET_CONTACTS no longer lists it |
-| 11 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
+| 11 | Rejected send not echoed | SEND_CHAN_MSG to an unknown channel gets ERROR and no echo reaches the other client |
+| 12 | TCP reconnection | Kills fake radio: clients are closed and new connections refused; after reconnect GET_CHANNEL works |
 
 ### Fake radio
 
@@ -188,4 +190,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 21/21 PASS (11 cases) on TCP backend against fake radio
+- **Tests**: 23/23 PASS (12 cases) on TCP backend against fake radio

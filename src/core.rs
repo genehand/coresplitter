@@ -82,10 +82,18 @@ impl Awaiting {
 struct InFlight {
     /// `None` for internal sync commands (sync_from_radio); `Some` for client requests.
     client_id: Option<ClientId>,
-    cmd_code: u8,
+    /// The command as sent, for side effects that must wait until the
+    /// radio accepts it (see on_command_accepted).
+    payload: Vec<u8>,
     /// When the command was sent or, for streams, the last frame arrived.
     last_activity: Instant,
     awaiting: Awaiting,
+}
+
+impl InFlight {
+    fn cmd_code(&self) -> u8 {
+        self.payload[0]
+    }
 }
 
 #[derive(Debug)]
@@ -612,7 +620,6 @@ impl Core {
             {
                 continue;
             }
-            let cmd_code = next.payload[0];
             let tx = self.radio_send_tx.as_ref()?;
             if tx.send(next.payload.clone()).is_err() {
                 if let Some(cid) = next.client_id {
@@ -622,9 +629,9 @@ impl Core {
             }
             self.in_flight = Some(InFlight {
                 client_id: next.client_id,
-                cmd_code,
                 last_activity: Instant::now(),
                 awaiting: awaiting_for(&next.payload),
+                payload: next.payload,
             });
             return Some(());
         }
@@ -734,18 +741,6 @@ impl Core {
             return;
         }
 
-        if let Some(cid) = client_id {
-            match cmd_code {
-                0x02 if payload.len() >= 14 => {
-                    self.synthesize_contact_echo(&cid, &payload).await;
-                }
-                0x03 if payload.len() >= 8 => {
-                    self.synthesize_channel_echo(&cid, &payload).await;
-                }
-                _ => {}
-            }
-        }
-
         match cmd_code {
             // REMOVE_CONTACT: drop it from the cache too, otherwise the
             // next cached GET_CONTACTS would resurrect it.
@@ -769,10 +764,26 @@ impl Core {
 
         self.in_flight = Some(InFlight {
             client_id,
-            cmd_code,
             last_activity: Instant::now(),
             awaiting: awaiting_for(&payload),
+            payload,
         });
+    }
+
+    /// Side effects of a command that only make sense once the radio has
+    /// accepted it, i.e. its reply was anything but ERROR.
+    async fn on_command_accepted(&self, client_id: Option<ClientId>, payload: &[u8]) {
+        if let Some(cid) = client_id {
+            match payload[0] {
+                0x02 if payload.len() >= 14 => {
+                    self.synthesize_contact_echo(&cid, payload).await;
+                }
+                0x03 if payload.len() >= 8 => {
+                    self.synthesize_channel_echo(&cid, payload).await;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Pop and dispatch the next queued command for which the originating
@@ -867,13 +878,13 @@ impl Core {
         if let Some(cid) = f.client_id {
             tracing::warn!(
                 client = %cid,
-                cmd = format_args!("0x{:02x}", f.cmd_code),
+                cmd = format_args!("0x{:02x}", f.cmd_code()),
                 "in_flight timeout, replying ERROR"
             );
             self.send_to_client(&cid, vec![0x01, 0x01]);
         } else {
             tracing::warn!(
-                cmd = format_args!("0x{:02x}", f.cmd_code),
+                cmd = format_args!("0x{:02x}", f.cmd_code()),
                 "in_flight sync timeout, discarding"
             );
         }
@@ -1039,7 +1050,7 @@ impl Core {
         }
 
         let client_id = in_flight.client_id;
-        let cmd_code = in_flight.cmd_code;
+        let cmd_code = in_flight.cmd_code();
 
         if let Some(cid) = client_id {
             // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
@@ -1070,7 +1081,11 @@ impl Core {
         }
 
         if is_terminator {
-            self.in_flight = None;
+            let done = self.in_flight.take().expect("checked Some above");
+            if code != 0x01 {
+                self.on_command_accepted(done.client_id, &done.payload)
+                    .await;
+            }
             self.advance_queue().await;
         } else if let Some(f) = self.in_flight.as_mut() {
             f.last_activity = Instant::now();

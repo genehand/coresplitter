@@ -402,8 +402,13 @@ class FakeRadio:
 
             case 0x03:
                 # Real firmware answers SEND_CHANNEL_TXT_MSG with OK, not
-                # MSG_SENT: channel messages have no ACK to wait for.
-                w.write(respond_ok())
+                # MSG_SENT: channel messages have no ACK to wait for. An
+                # unknown channel gets ERR_CODE_NOT_FOUND.
+                idx = rest[1] if len(rest) > 1 else 0
+                if any(c["idx"] == idx for c in self.channels):
+                    w.write(respond_ok())
+                else:
+                    w.write(respond_error(2))
                 await w.drain()
 
             case 0x04:

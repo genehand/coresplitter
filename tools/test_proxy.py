@@ -498,7 +498,7 @@ async def test_send_contact_msg(proxy_port):
 
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
-    log.info("--- Test 11: TCP disconnection + reconnection ---")
+    log.info("--- Test 12: TCP disconnection + reconnection ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -686,6 +686,52 @@ async def test_remove_contact(proxy_port):
     await c.close()
 
 
+async def test_rejected_send_not_echoed(proxy_port):
+    log.info("--- Test 11: Rejected send is not echoed ---")
+    c1 = await connect_client(port=proxy_port)
+    c2 = await connect_client(port=proxy_port)
+    if not await c1.appstart() or not await c2.appstart():
+        fail("SELF_INFO failed for one or both clients")
+        await c1.close()
+        await c2.close()
+        return
+
+    # Channel 30 does not exist on the radio: it must answer ERROR and
+    # the other clients must not see the message as if it had been sent.
+    ts = int(time.time())
+    await c1.send(b"\x03" + bytes([0, 30]) + struct.pack("<I", ts) + b"never sent")
+    reply = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await c1.recv(1)
+        if p is None:
+            break
+        if len(p) and p[0] in (0x00, 0x01):
+            reply = p
+            break
+    if reply and reply[0] == 0x01:
+        ok("SEND_CHAN_MSG to unknown channel → ERROR")
+    else:
+        fail(f"SEND_CHAN_MSG to unknown channel: {reply.hex() if reply else 'None'}")
+
+    echoed = False
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 2:
+        p = await c2.recv(0.5)
+        if p is None:
+            break
+        if len(p) and p[0] == 0x08 and b"never sent" in p:
+            echoed = True
+            break
+    if echoed:
+        fail("c2 received an echo of a message the radio rejected")
+    else:
+        ok("rejected message is not echoed to other clients")
+
+    await c1.close()
+    await c2.close()
+
+
 # --- Harness ---
 
 fake_proc = None
@@ -778,6 +824,7 @@ async def main():
     await test_send_contact_msg(proxy_port)
     await test_get_msg_fans_out(proxy_port)
     await test_remove_contact(proxy_port)
+    await test_rejected_send_not_echoed(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL
