@@ -497,7 +497,7 @@ async def test_send_contact_msg(proxy_port):
 
 async def test_reconnect_tcp(proxy_port):
     global fake_proc, fake_pid, fake_port
-    log.info("--- Test 10: TCP disconnection + reconnection ---")
+    log.info("--- Test 11: TCP disconnection + reconnection ---")
     c = await connect_client(port=proxy_port)
     r = await c.appstart()
     if not r:
@@ -603,6 +603,70 @@ async def test_get_msg_fans_out(proxy_port):
     await c2.close()
 
 
+async def _get_contact_names(c):
+    """GET_CONTACTS and return the names in the stream, or None on failure."""
+    await c.send(b"\x04")
+    names = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await c.recv(2)
+        if p is None:
+            return None
+        if len(p) == 0:
+            continue
+        if p[0] == 0x03 and len(p) >= 132:
+            names.append(p[100:132].rstrip(b"\x00").decode("utf-8", "replace"))
+        elif p[0] == 0x04:
+            return names
+    return None
+
+
+async def test_remove_contact(proxy_port):
+    log.info("--- Test 10: REMOVE_CONTACT also purges the cache ---")
+    c = await connect_client(port=proxy_port)
+    if not await c.appstart():
+        fail("SELF_INFO failed")
+        await c.close()
+        return
+
+    names = await _get_contact_names(c)
+    if not names or "Bravo Test" not in names:
+        fail(f"GET_CONTACTS before remove: {names}")
+        await c.close()
+        return
+
+    bravo_key = bytes.fromhex(
+        "1122334455661122334455661122334455661122334455661122334455661122"
+    )
+    await c.send(b"\x0f" + bravo_key)
+    reply = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        p = await c.recv(2)
+        if p is None:
+            break
+        if len(p) and p[0] in (0x00, 0x01):
+            reply = p
+            break
+    if reply is None or reply[0] != 0x00:
+        fail(f"REMOVE_CONTACT reply: {reply.hex() if reply else 'None'}")
+        await c.close()
+        return
+    ok("REMOVE_CONTACT → OK (0x00)")
+
+    names = await _get_contact_names(c)
+    if names is None:
+        fail("GET_CONTACTS after remove failed")
+    elif "Bravo Test" in names:
+        fail(f"removed contact still served from cache: {names}")
+    elif "Alpha Test" not in names:
+        fail(f"remaining contact missing after remove: {names}")
+    else:
+        ok("GET_CONTACTS no longer lists the removed contact")
+
+    await c.close()
+
+
 # --- Harness ---
 
 fake_proc = None
@@ -694,6 +758,7 @@ async def main():
     await test_long_message(proxy_port)
     await test_send_contact_msg(proxy_port)
     await test_get_msg_fans_out(proxy_port)
+    await test_remove_contact(proxy_port)
     await test_reconnect_tcp(proxy_port)
 
     total = PASS + FAIL

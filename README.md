@@ -142,7 +142,7 @@ uv run tools/test_proxy.py
 All tests run sequentially. Each cycle spawns a fresh proxy and fake radio,
 runs the tests, and cleans up.
 
-### Current tests (10 cases, 17 assertions, all PASS)
+### Current tests (11 cases, 19 assertions, all PASS)
 
 | # | Test | Description |
 |---|------|-------------|
@@ -155,7 +155,8 @@ runs the tests, and cleans up.
 | 7 | Long message (>133 chars) | Two clients: one sends long text, the other receives the intact broadcast |
 | 8 | Contact send (0x02) | Two clients: one sends SEND_MSG, the other receives the raw payload broadcast |
 | 9 | GET_MSG reply fans out | Two clients; one polls via GET_MSG, the other sees the same frame via broadcast |
-| 10 | TCP reconnection | Kills fake radio, waits for reconnect, verifies GET_CHANNEL works |
+| 10 | REMOVE_CONTACT purges cache | Removes a contact; the next cached GET_CONTACTS no longer lists it |
+| 11 | TCP reconnection | Kills fake radio, waits for reconnect, verifies GET_CHANNEL works |
 
 ### Fake radio
 
@@ -184,4 +185,4 @@ docker run --rm coresplitter --help
 - **TCP backend**: tested against a real radio (Heltec V3, firmware v1.15.0)
 - **Serial backend**: implemented, pending hardware test
 - **BLE backend**: implemented, pending hardware test
-- **Tests**: 17/17 PASS (10 cases) on TCP backend against fake radio
+- **Tests**: 19/19 PASS (11 cases) on TCP backend against fake radio

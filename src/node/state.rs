@@ -158,6 +158,14 @@ impl NodeState {
         Ok(())
     }
 
+    pub async fn delete_contact(&self, public_key: &[u8]) -> Result<()> {
+        sqlx::query("DELETE FROM contacts WHERE public_key = ?1")
+            .bind(public_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_channel(&self, idx: i64) -> Result<()> {
         sqlx::query("DELETE FROM channels WHERE idx = ?1")
             .bind(idx)

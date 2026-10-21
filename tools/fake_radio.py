@@ -445,6 +445,20 @@ class FakeRadio:
                 w.write(respond_ok())
                 await w.drain()
 
+            case 0x0F:
+                key = rest[:32]
+                idx = next(
+                    (i for i, c in enumerate(DEFAULT_CONTACTS) if c["key"] == key),
+                    None,
+                )
+                if idx is not None:
+                    removed = DEFAULT_CONTACTS.pop(idx)
+                    print(f"     -> Contacto borrado: {removed['name']!r}")
+                    w.write(respond_ok())
+                else:
+                    w.write(respond_error(2))  # ERR_CODE_NOT_FOUND
+                await w.drain()
+
             case 0x14:
                 w.write(respond_battery())
                 await w.drain()
@@ -552,6 +566,7 @@ CMD_NAMES = {
     0x0C: "SetTxPower",
     0x0D: "ResetPath",
     0x0E: "SetCoords",
+    0x0F: "RemoveContact",
     0x14: "GetBattery",
     0x16: "DeviceQuery",
     0x1A: "SendLogin",

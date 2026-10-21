@@ -673,6 +673,13 @@ impl Core {
         }
 
         match cmd_code {
+            // REMOVE_CONTACT: drop it from the cache too, otherwise the
+            // next cached GET_CONTACTS would resurrect it.
+            0x0F if payload.len() >= 33 => {
+                if let Err(e) = self.state.delete_contact(&payload[1..33]).await {
+                    tracing::warn!(error = %e, "failed to delete cached contact");
+                }
+            }
             0x20 if payload.len() > 1 => {
                 let idx = payload[1] as i64;
                 let _ = self.state.delete_channel(idx).await;
