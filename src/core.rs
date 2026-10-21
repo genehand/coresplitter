@@ -1013,8 +1013,30 @@ impl Core {
                 let idx = payload[1] as i64;
                 let _ = self.state.delete_channel(idx).await;
             }
-            // Setters that mutate SELF_INFO / DEVICE_INFO / BATTERY.
-            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 => {
+            // Setters that mutate a cached blob. Clearing it means the next
+            // client to ask re-reads from the radio, which is how the cache
+            // converges after any write.
+            //
+            //   SELF_INFO:   0x08 name, 0x0B radio, 0x0C tx power, 0x0E coords,
+            //                0x15 tuning, 0x26 other params, 0x33 factory reset
+            //   DEVICE_INFO: 0x0B repeat flag, 0x25 BLE pin, 0x33 reset,
+            //                0x3D path hash mode
+            //   all three:   0x42 run CLI command
+            //
+            // 0x3D is easy to miss: CMD_SET_PATH_HASH_MODE writes byte 81 of
+            // DEVICE_INFO (`MyMesh.cpp`), a trailing field a reader of the blob
+            // skips -- but a client that asks again would then be told the old
+            // mode forever.
+            //
+            // 0x42 is the same trap from the other side. MeshCore 1.18.0 grew
+            // CMD_RUN_CLI_COMMAND, whose CLI is a second, parallel setter path:
+            // `set name`, `set radio`, `set tx`, `set lat`/`set lon`,
+            // `set multi.acks`, `set path.hash.mode` and `set pin` reach the
+            // same fields through CommonRadioPrefs::handleCommand instead of
+            // the CMD_SET_* handlers, so none of the arms above fire for them.
+            // Invalidated unconditionally: a CLI `get ...` costs one re-read, a
+            // CLI `set ...` left cached is served stale forever.
+            0x08 | 0x0B | 0x0C | 0x0E | 0x15 | 0x25 | 0x26 | 0x33 | 0x3D | 0x42 => {
                 self.self_info_raw = None;
                 self.device_info_raw = None;
                 self.battery_info_raw = None;
