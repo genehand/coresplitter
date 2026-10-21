@@ -34,16 +34,42 @@ fn is_push_event(code: u8) -> bool {
 /// What a request is waiting for, to know when to free the slot.
 #[derive(Debug, Clone)]
 enum Awaiting {
-    /// Any single non-push response frame completes the request. This is
-    /// the default for most commands: the radio replies with exactly one
-    /// frame per command (OK / ERROR / DEVICE_INFO / CHANNEL_INFO / ...).
+    /// Any single non-push frame completes the request. Fallback for
+    /// commands not listed in `awaiting_for`, so new firmware commands
+    /// keep working without a per-command entry.
     Any,
+    /// A single frame whose code is one of these (or ERROR, which every
+    /// command may return). Pinning the expected codes keeps a late reply
+    /// to a timed-out request from being taken as the answer to the next
+    /// one. May list a push code when the firmware replies with one.
+    OneOf(&'static [u8]),
     /// A multi-frame stream: any frame whose code is in `frame_codes`
     /// belongs to the response; the request completes with `terminator_code`.
     Stream {
-        frame_codes: Vec<u8>,
+        frame_codes: &'static [u8],
         terminator_code: u8,
     },
+}
+
+impl Awaiting {
+    /// Returns `(belongs, completes)` for a frame with `code`: whether it
+    /// is part of the reply and whether it terminates the request.
+    /// Push events never belong unless the command's reply is explicitly
+    /// listed as one (see awaiting_for). ERROR answers any single-frame
+    /// command.
+    fn classify(&self, code: u8) -> (bool, bool) {
+        match self {
+            Awaiting::Any => (!is_push_event(code), true),
+            Awaiting::OneOf(codes) => (code == 0x01 || codes.contains(&code), true),
+            Awaiting::Stream {
+                frame_codes,
+                terminator_code,
+            } => {
+                let in_stream = frame_codes.contains(&code) || code == *terminator_code;
+                (in_stream, code == *terminator_code)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -62,18 +88,48 @@ struct Queued {
     payload: Vec<u8>,
 }
 
-/// Map a client command code to the shape of the radio's reply.
-fn awaiting_for(cmd_code: u8) -> Awaiting {
-    match cmd_code {
-        // GET_CONTACTS → CONTACT_START + N x CONTACT + CONTACT_END
+/// Map a command to the shape of the radio's reply, as written by the
+/// companion firmware (examples/companion_radio/MyMesh.cpp).
+fn awaiting_for(payload: &[u8]) -> Awaiting {
+    match payload[0] {
+        // GET_CONTACTS → CONTACTS_START + N x CONTACT + END_OF_CONTACTS
         0x04 => Awaiting::Stream {
-            frame_codes: vec![0x02, 0x03],
+            frame_codes: &[0x02, 0x03],
             terminator_code: 0x04,
         },
-        // Every other command replies with a single non-push frame.
-        // Routing is decided by "not a push event" rather than by an
-        // explicit allow-list so unusual commands (SHARE_CONTACT,
-        // GET_TELEMETRY, GET_STATS, ...) work without per-command entries.
+        0x01 => Awaiting::OneOf(&[0x05]), // APP_START → SELF_INFO
+        // SEND_TXT_MSG, SEND_LOGIN, SEND_STATUS_REQ, SEND_TRACE_PATH,
+        // SEND_BINARY_REQ, SEND_PATH_DISCOVERY_REQ, SEND_ANON_REQ → SENT
+        0x02 | 0x1A | 0x1B | 0x24 | 0x32 | 0x34 | 0x39 => Awaiting::OneOf(&[0x06]),
+        // SEND_TELEMETRY_REQ: about ourselves (len 4) the firmware answers
+        // straight away with the TELEMETRY_RESPONSE push; for a remote
+        // node it replies SENT and the push comes later.
+        0x27 if payload.len() == 4 => Awaiting::OneOf(&[0x8B]),
+        0x27 => Awaiting::OneOf(&[0x06]),
+        0x05 => Awaiting::OneOf(&[0x09]), // GET_DEVICE_TIME → CURR_TIME
+        // SYNC_NEXT_MESSAGE → a queued message or NO_MORE_MESSAGES
+        0x0A => Awaiting::OneOf(&[0x07, 0x08, 0x10, 0x11, 0x1B, 0x0A]),
+        0x11 => Awaiting::OneOf(&[0x0B]),       // EXPORT_CONTACT
+        0x14 => Awaiting::OneOf(&[0x0C]),       // GET_BATT_AND_STORAGE
+        0x16 => Awaiting::OneOf(&[0x0D]),       // DEVICE_QUERY → DEVICE_INFO
+        0x17 => Awaiting::OneOf(&[0x0E, 0x0F]), // EXPORT_PRIVATE_KEY
+        0x18 => Awaiting::OneOf(&[0x00, 0x0F]), // IMPORT_PRIVATE_KEY
+        0x1E => Awaiting::OneOf(&[0x03]),       // GET_CONTACT_BY_KEY → CONTACT
+        0x1F => Awaiting::OneOf(&[0x12]),       // GET_CHANNEL → CHANNEL_INFO
+        0x21 => Awaiting::OneOf(&[0x13]),       // SIGN_START
+        0x23 => Awaiting::OneOf(&[0x14]),       // SIGN_FINISH → SIGNATURE
+        0x28 => Awaiting::OneOf(&[0x15]),       // GET_CUSTOM_VARS
+        0x2A => Awaiting::OneOf(&[0x16]),       // GET_ADVERT_PATH
+        0x2B => Awaiting::OneOf(&[0x17]),       // GET_TUNING_PARAMS
+        0x38 => Awaiting::OneOf(&[0x18]),       // GET_STATS
+        0x3B => Awaiting::OneOf(&[0x19]),       // GET_AUTOADD_CONFIG
+        0x3C => Awaiting::OneOf(&[0x1A]),       // GET_ALLOWED_REPEAT_FREQ
+        0x40 => Awaiting::OneOf(&[0x1C]),       // GET_DEFAULT_FLOOD_SCOPE
+        0x42 => Awaiting::OneOf(&[0x1D]),       // RUN_CLI_COMMAND → CLI_REPLY
+        // Setters and actions that only ever answer OK / ERROR.
+        0x03 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0B | 0x0C | 0x0D | 0x0E | 0x0F | 0x10 | 0x12
+        | 0x15 | 0x19 | 0x1C | 0x1D | 0x20 | 0x22 | 0x25 | 0x26 | 0x29 | 0x33 | 0x36 | 0x37
+        | 0x3A | 0x3D | 0x3E | 0x3F | 0x41 => Awaiting::OneOf(&[0x00]),
         _ => Awaiting::Any,
     }
 }
@@ -135,9 +191,9 @@ pub struct Core {
     // Clients waiting for the (possibly much later) LoRa-delivery ACK
     // (0x82), keyed by the 4-byte expected_ack the radio handed back in
     // the corresponding MSG_SENT. The Instant is the insertion time,
-    // used to evict stale entries when a new ack is recorded. Channel
-    // sends (0x03) never produce an ACK, so without eviction those
-    // entries would accumulate forever.
+    // used to evict stale entries when a new ack is recorded. SENT also
+    // closes login/status/telemetry requests, which never produce an
+    // ACK, so without eviction those entries would accumulate forever.
     pending_acks: HashMap<[u8; 4], (ClientId, Instant)>,
 }
 
@@ -561,7 +617,7 @@ impl Core {
                 client_id: next.client_id,
                 cmd_code,
                 sent_at: Instant::now(),
-                awaiting: awaiting_for(cmd_code),
+                awaiting: awaiting_for(&next.payload),
             });
             return Some(());
         }
@@ -708,7 +764,7 @@ impl Core {
             client_id,
             cmd_code,
             sent_at: Instant::now(),
-            awaiting: awaiting_for(cmd_code),
+            awaiting: awaiting_for(&payload),
         });
     }
 
@@ -947,9 +1003,19 @@ impl Core {
         if self.try_route_ack(resp_code, &payload) {
             return;
         }
-        // 3. Otherwise it's a spontaneous push event from the radio
-        //    (MESSAGES_WAITING, ADVERTISEMENT, NEW_ADVERT, ...).
-        let _ = self.broadcast_tx.send(payload);
+        // 3. A push event from the radio (MESSAGES_WAITING, ADVERTISEMENT,
+        //    NEW_ADVERT, ...) goes to everybody.
+        if is_push_event(resp_code) {
+            let _ = self.broadcast_tx.send(payload);
+            return;
+        }
+        // 4. A reply nobody is waiting for: typically the late answer to a
+        //    request that already timed out. Handing it to the clients would
+        //    only make them take it as the reply to something else.
+        tracing::warn!(
+            code = format_args!("0x{resp_code:02x}"),
+            "dropping unsolicited radio response"
+        );
     }
 
     /// Match the response against the current in_flight request. Returns
@@ -959,21 +1025,7 @@ impl Core {
             return false;
         };
 
-        // Push events never complete a request, even if a slot is open.
-        if is_push_event(code) {
-            return false;
-        }
-
-        let (matched, is_terminator) = match &in_flight.awaiting {
-            Awaiting::Any => (true, true),
-            Awaiting::Stream {
-                frame_codes,
-                terminator_code,
-            } => {
-                let in_stream = frame_codes.contains(&code) || code == *terminator_code;
-                (in_stream, code == *terminator_code)
-            }
-        };
+        let (matched, is_terminator) = in_flight.awaiting.classify(code);
 
         if !matched {
             return false;
@@ -985,8 +1037,9 @@ impl Core {
         if let Some(cid) = client_id {
             // If this is the MSG_SENT closing a SEND_*, stash the expected_ack
             // so the later 0x82 finds its way back. Lazy GC: purge stale
-            // entries first so the map stays bounded (channel sends never
-            // produce an ACK, so without this they'd accumulate forever).
+            // entries first so the map stays bounded (SENT also closes
+            // login/status/telemetry requests, which never get an 0x82, so
+            // without this they'd accumulate forever).
             if code == 0x06
                 && payload.len() >= 6
                 && let Ok(ack) = <[u8; 4]>::try_from(&payload[2..6])
@@ -1317,4 +1370,51 @@ fn build_appstart() -> Vec<u8> {
     payload.push(1);
     payload.extend_from_slice(app_name);
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_codes_are_the_high_bit_range() {
+        assert!(is_push_event(0x80));
+        assert!(is_push_event(0x82));
+        assert!(is_push_event(0x8F));
+        assert!(!is_push_event(0x00));
+        assert!(!is_push_event(0x12));
+    }
+
+    #[test]
+    fn late_reply_does_not_complete_other_command() {
+        // A SELF_INFO that arrives late must not be taken as the
+        // CHANNEL_INFO a GET_CHANNEL is waiting for.
+        let get_channel = awaiting_for(&[0x1F, 0]);
+        assert_eq!(get_channel.classify(0x05), (false, true));
+        assert_eq!(get_channel.classify(0x12), (true, true));
+        assert_eq!(get_channel.classify(0x01), (true, true));
+    }
+
+    #[test]
+    fn channel_send_expects_ok_not_sent() {
+        let send_chan = awaiting_for(&[0x03, 0, 0, 0, 0, 0, 0, b'x']);
+        assert!(send_chan.classify(0x00).0);
+        assert!(!send_chan.classify(0x06).0);
+    }
+
+    #[test]
+    fn self_telemetry_reply_is_a_push() {
+        let self_telemetry = awaiting_for(&[0x27, 0, 0, 0]);
+        assert!(self_telemetry.classify(0x8B).0);
+        let remote_telemetry = awaiting_for(&[0x27; 36]);
+        assert!(!remote_telemetry.classify(0x8B).0);
+        assert!(remote_telemetry.classify(0x06).0);
+    }
+
+    #[test]
+    fn unknown_command_takes_any_non_push() {
+        let unknown = awaiting_for(&[0x7E]);
+        assert!(unknown.classify(0x2A).0);
+        assert!(!unknown.classify(0x83).0);
+    }
 }
