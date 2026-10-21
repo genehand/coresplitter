@@ -9,7 +9,7 @@ use tokio::time::{self, Duration};
 
 use crate::backend;
 use crate::frontend::tcp::{ClientCommand, ClientDirectMap, ClientId, TcpFrontend};
-use crate::node::state::{CachedChannel, CachedContact, NodeState};
+use crate::node::state::{CachedChannel, CachedContact, NodeState, Retention};
 use crate::protocol::decode::{
     DecodedValue, decode_command_payload, decode_response_payload, format_decoded,
 };
@@ -22,6 +22,8 @@ const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 /// out_path(64) + name(32) + last_advert + lat + lon + lastmod (4 each).
 const CONTACT_FRAME_LEN: usize = 148;
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the database is purged according to the retention settings.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// Maximum age of a pending_acks entry before it is considered abandoned.
 /// LoRa retransmissions inside the radio top out around ~30 s; five minutes
 /// is comfortably above any realistic real ACK and short enough to bound
@@ -90,6 +92,8 @@ struct InFlight {
     payload: Vec<u8>,
     /// When the command was sent or, for streams, the last frame arrived.
     last_activity: Instant,
+    /// Wall-clock dispatch time (unix secs), comparable with DB timestamps.
+    sent_unix: i64,
     awaiting: Awaiting,
 }
 
@@ -174,6 +178,7 @@ pub struct CoreConfig {
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
     pub record_radio_rx: bool,
+    pub retention: Retention,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +315,9 @@ impl Core {
 
         let mut timeout_tick = tokio::time::interval(TIMEOUT_CHECK_INTERVAL);
         timeout_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // First tick fires immediately: maintenance also runs at startup.
+        let mut maintenance_tick = tokio::time::interval(MAINTENANCE_INTERVAL);
+        maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -336,6 +344,9 @@ impl Core {
                 _ = timeout_tick.tick() => {
                     self.check_in_flight_timeout().await;
                 }
+                _ = maintenance_tick.tick() => {
+                    self.run_maintenance().await;
+                }
             }
         }
 
@@ -343,6 +354,33 @@ impl Core {
         self.shutdown().await;
 
         Ok(())
+    }
+
+    async fn run_maintenance(&mut self) {
+        let retention = self.config.retention;
+        // Contact purging relies on the last full sync to tell which
+        // contacts the radio no longer has; keep that sync fresh even if
+        // the proxy runs for weeks without reconnecting.
+        let full_sync_pending = self.in_flight.as_ref().is_some_and(|f| f.payload == [0x04])
+            || self.pending_queue.iter().any(|q| q.payload == [0x04]);
+        if retention.contacts_days > 0 && !full_sync_pending {
+            self.pending_queue.push_back(Queued {
+                client_id: None,
+                payload: vec![0x04],
+            });
+            if self.in_flight.is_none() {
+                self.advance_queue().await;
+            }
+        }
+        match self.state.maintain(&retention).await {
+            Ok(stats) => tracing::info!(
+                messages = stats.messages,
+                raw_rx = stats.raw_rx,
+                contacts = stats.contacts,
+                "database maintenance done"
+            ),
+            Err(e) => tracing::warn!(error = %e, "database maintenance failed"),
+        }
     }
 
     async fn shutdown(&mut self) {
@@ -633,6 +671,7 @@ impl Core {
             self.in_flight = Some(InFlight {
                 client_id: next.client_id,
                 last_activity: Instant::now(),
+                sent_unix: chrono::Utc::now().timestamp(),
                 awaiting: awaiting_for(&next.payload),
                 payload: next.payload,
             });
@@ -774,6 +813,7 @@ impl Core {
         self.in_flight = Some(InFlight {
             client_id,
             last_activity: Instant::now(),
+            sent_unix: chrono::Utc::now().timestamp(),
             awaiting: awaiting_for(&payload),
             payload,
         });
@@ -781,10 +821,18 @@ impl Core {
 
     /// Side effects of a command that only make sense once the radio has
     /// accepted it, i.e. its reply was anything but ERROR.
-    async fn on_command_accepted(&mut self, client_id: Option<ClientId>, payload: &[u8]) {
+    async fn on_command_accepted(&mut self, done: &InFlight) {
+        let (client_id, payload) = (done.client_id, done.payload.as_slice());
         // Contact table changes: re-read what the radio now holds so the
         // cache serves the same frame (path, flags, lastmod) it would.
         match payload[0] {
+            // A complete, unfiltered GET_CONTACTS: every contact the radio
+            // holds was just re-cached with seen_at >= the dispatch time.
+            0x04 if payload.len() == 1 => {
+                if let Err(e) = self.state.set_contacts_synced_at(done.sent_unix).await {
+                    tracing::warn!(error = %e, "failed to record contacts sync time");
+                }
+            }
             // ADD_UPDATE_CONTACT, RESET_PATH: [cmd, pubkey(32), ...]
             0x09 | 0x0D if payload.len() >= 33 => self.queue_contact_refresh(&payload[1..33]),
             // IMPORT_CONTACT takes an advert blob; the key isn't at a fixed
@@ -1132,8 +1180,7 @@ impl Core {
         if is_terminator {
             let done = self.in_flight.take().expect("checked Some above");
             if code != 0x01 {
-                self.on_command_accepted(done.client_id, &done.payload)
-                    .await;
+                self.on_command_accepted(&done).await;
             }
             self.advance_queue().await;
         } else if let Some(f) = self.in_flight.as_mut() {

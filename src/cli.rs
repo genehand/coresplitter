@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::core::{BackendType, CoreConfig, LogLevel};
+use crate::node::state::Retention;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,6 +68,27 @@ pub struct Cli {
     /// Record all raw radio RX payloads into the raw_rx database table
     #[arg(long, env = "CORESPLITTER_RECORD_RADIO_RX")]
     pub record_radio_rx: bool,
+
+    /// Days to keep stored messages (0 = forever)
+    #[arg(
+        long,
+        default_value_t = 30,
+        env = "CORESPLITTER_MESSAGES_RETENTION_DAYS"
+    )]
+    pub messages_retention_days: u32,
+
+    /// Days to keep raw_rx recordings (0 = forever)
+    #[arg(long, default_value_t = 7, env = "CORESPLITTER_RAW_RX_RETENTION_DAYS")]
+    pub raw_rx_retention_days: u32,
+
+    /// Days a contact may be missing from the radio before it is dropped
+    /// from the cache (0 = never)
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "CORESPLITTER_CONTACTS_RETENTION_DAYS"
+    )]
+    pub contacts_retention_days: u32,
 }
 
 impl Cli {
@@ -101,6 +123,11 @@ impl Cli {
             event_log_level,
             event_log_json: self.json,
             record_radio_rx: self.record_radio_rx,
+            retention: Retention {
+                messages_days: self.messages_retention_days,
+                raw_rx_days: self.raw_rx_retention_days,
+                contacts_days: self.contacts_retention_days,
+            },
         }
     }
 }

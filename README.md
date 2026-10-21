@@ -134,6 +134,25 @@ cargo run --release --features ble -- \
 | `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `CORESPLITTER_LOG_JSON` | Enable JSON event logging |
 | `CORESPLITTER_RECORD_RADIO_RX` | Record all raw radio RX to database |
+| `CORESPLITTER_MESSAGES_RETENTION_DAYS` | Days to keep stored messages, 0 = forever (default: 30) |
+| `CORESPLITTER_RAW_RX_RETENTION_DAYS` | Days to keep raw_rx recordings, 0 = forever (default: 7) |
+| `CORESPLITTER_CONTACTS_RETENTION_DAYS` | Days a contact may be missing from the radio before it leaves the cache, 0 = never (default: 0) |
+
+### Database maintenance
+
+At startup and every 24 hours the proxy purges the SQLite database
+according to the retention settings above, then returns the freed space
+with an incremental vacuum.
+
+- **Messages** expire by local arrival time, not by the sender's
+  timestamp, which can be arbitrarily wrong.
+- **Contacts** are kept by default even when the radio no longer
+  reports them: the cache is a safeguard against a node losing its
+  contacts (firmware reflash, factory reset). With a retention set, a
+  contact is only dropped if it was missing from the last full contact
+  sync *and* the radio hasn't reported it for that many days. In that
+  mode the maintenance pass also triggers a full sync, so that "last
+  sync" stays recent on long-running proxies.
 
 ## Test suite
 
