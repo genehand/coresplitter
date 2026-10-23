@@ -179,6 +179,56 @@ with an incremental vacuum.
   mode the maintenance pass also triggers a full sync, so that "last
   sync" stays recent on long-running proxies.
 
+### Running as a systemd service
+
+Install the binary as `/usr/local/bin/coresplitter` and create
+`/etc/systemd/system/coresplitter.service`:
+
+```ini
+[Unit]
+Description=MeshCore client multiplexer with cache
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/coresplitter
+EnvironmentFile=-/etc/coresplitter.conf
+Environment=CORESPLITTER_DATA_DIR=/var/lib/coresplitter
+DynamicUser=yes
+StateDirectory=coresplitter
+# Serial backend: grant access to the port (dialout on Debian/Ubuntu,
+# uucp on Arch)
+#SupplementaryGroups=dialout
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The configuration goes in `/etc/coresplitter.conf` using the
+[environment variables](#environment-variables) above, for example:
+
+```bash
+CORESPLITTER_SERIAL_PORT=/dev/ttyUSB0
+CORESPLITTER_TCP_FRONTEND_PORT=5000,5001
+CORESPLITTER_MESSAGES_RETENTION_DAYS=365
+```
+
+Then enable it and follow the log:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now coresplitter
+journalctl -u coresplitter -f
+```
+
+`DynamicUser` runs the proxy as a throwaway unprivileged user, and
+`StateDirectory` gives it a persistent `/var/lib/coresplitter` for the
+database. There is no need to restart the service when the radio goes
+away: the proxy keeps retrying the connection on its own and stops
+cleanly on `systemctl stop`.
+
 ## Test suite
 
 ### Integration tests
